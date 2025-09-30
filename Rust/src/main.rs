@@ -13,10 +13,16 @@ use std::thread;
 const DEFAULT_THREADS: usize = 4;
 
 #[derive(Clone)]
+struct Pattern {
+    prefix: Vec<u8>,
+    suffix: Vec<u8>, // prefix + '='
+    suffix_off: usize,
+}
+
+#[derive(Clone)]
 struct Config {
     threads: usize,
-    search: String,
-    suffix: String, // search + '='
+    patterns: Vec<Pattern>,
     count: u64,
     quiet: bool,
     affinity: bool,
@@ -40,7 +46,7 @@ fn human(n: u64) -> String {
 fn parse_args() -> Result<Config, String> {
     let args: Vec<String> = env::args().collect();
     let mut threads = DEFAULT_THREADS;
-    let mut search: Option<String> = None;
+    let mut searches: Vec<String> = Vec::new();
     let mut count: u64 = 1;
     let mut quiet: bool = false;
     let mut affinity: bool = false;
@@ -55,7 +61,7 @@ fn parse_args() -> Result<Config, String> {
             }
             "-s" | "--search" => {
                 i += 1; if i >= args.len() { return Err("missing value for --search".into()); }
-                search = Some(args[i].clone());
+                searches.push(args[i].clone());
             }
             "-c" | "--count" => {
                 i += 1; if i >= args.len() { return Err("missing value for --count".into()); }
@@ -77,16 +83,23 @@ fn parse_args() -> Result<Config, String> {
         i += 1;
     }
 
-    let search = search.ok_or_else(|| "--search is required".to_string())?;
-    if !is_base64_search(&search) { return Err("search must contain only Base64 chars [A-Za-z0-9+/]".into()); }
-    let suffix = format!("{}=", search);
+    if searches.is_empty() { return Err("--search is required (can be specified multiple times)".into()); }
+    let mut patterns = Vec::with_capacity(searches.len());
+    for s in searches {
+        if !is_base64_search(&s) { return Err("search must contain only Base64 chars [A-Za-z0-9+/]".into()); }
+        let prefix = s.into_bytes();
+        let mut suffix = prefix.clone();
+        suffix.push(b'=');
+        let suffix_off = if suffix.len() <= 44 { 44 - suffix.len() } else { 0 };
+        patterns.push(Pattern { prefix, suffix, suffix_off });
+    }
 
-    Ok(Config { threads, search, suffix, count, quiet, affinity })
+    Ok(Config { threads, patterns, count, quiet, affinity })
 }
 
 fn print_usage(prog: &str) {
     eprintln!(
-        "Usage: {} -s STR [-t N] [-c C] [-q] [--affinity]\n  -s, --search  STR: Base64 chars only [A-Za-z0-9+/] (no '=')\n  -t, --threads N  : worker threads (default {})\n  -c, --count   C  : stop after C matches (default 1)\n  -q, --quiet      : disable periodic reporting\n      --affinity   : pin worker threads to CPU cores",
+        "Usage: {} -s STR [-s STR]... [-t N] [-c C] [-q] [--affinity]\n  -s, --search  STR: Base64 chars only [A-Za-z0-9+/] (no '='); can be given multiple times\n  -t, --threads N  : worker threads (default {})\n  -c, --count   C  : stop after C matches (default 1)\n  -q, --quiet      : disable periodic reporting\n      --affinity   : pin worker threads to CPU cores",
         prog, DEFAULT_THREADS
     );
 }
@@ -104,9 +117,7 @@ fn worker(cfg: Arc<Config>, stop: Arc<AtomicBool>, total: Arc<AtomicU64>, found:
     let mut sk = [0u8; 32];
     let mut b64_pub = [0u8; 44];  // public b64
     let mut b64_priv = [0u8; 44]; // private b64 (only used on match)
-    let prefix = cfg.search.as_bytes().to_owned();
-    let suffix = cfg.suffix.as_bytes().to_owned();
-    let suffix_off = if suffix.len() <= 44 { 44 - suffix.len() } else { 0 };
+    let patterns = cfg.patterns.clone();
     let mut local = 0u64;
 
     // Optional: set thread affinity for better cache locality
@@ -136,9 +147,14 @@ fn worker(cfg: Arc<Config>, stop: Arc<AtomicBool>, total: Arc<AtomicU64>, found:
             local = 0;
         }
 
-        let matches_prefix = enc.len() >= prefix.len() && &enc[..prefix.len()] == &*prefix;
-        let matches_suffix = enc.len() >= suffix.len() && &enc[suffix_off..] == &*suffix;
-        if matches_prefix || matches_suffix {
+        let mut matches_any = false;
+        for p in &patterns {
+            if (enc.len() >= p.prefix.len() && &enc[..p.prefix.len()] == &*p.prefix) ||
+               (enc.len() >= p.suffix.len() && &enc[p.suffix_off..] == &*p.suffix) {
+                matches_any = true; break;
+            }
+        }
+        if matches_any {
             // Encode private key only when needed and print both
             let n_priv = STANDARD.encode_slice(&sk, &mut b64_priv).unwrap();
             debug_assert_eq!(n_priv, 44);

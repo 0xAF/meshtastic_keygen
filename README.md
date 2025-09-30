@@ -32,16 +32,17 @@ There are two implementations:
 
 - Periodic stats every 5 seconds (rate is per-second): `Keys: total=1.23M, 456K/s`
 - Matches: `FOUND: <base64>`
+- Multiple patterns: pass -s/--search multiple times; each key is matched against all patterns (prefix and suffix with '=').
 - Output streams: `FOUND:` lines go to both stdout and stderr; all other messages (start, stats, summary) go to stderr. This lets you redirect stdout to capture just matches while still seeing finds in your terminal.
 
 ### Redirecting output
 
 ```sh
-# Save only matches (FOUND lines) to a file
-./C/meshtastic_keygen -s AAA/ -t 8 1>matches.txt
+# Save only matches (FOUND lines) to a file (still see finds on stderr)
+./C/meshtastic_keygen -s AAA -s ZZZ -t 8 1>matches.txt
 
 # Rust version
-./Rust/target/release/meshtastic_keygen_rs -s AAA+ -t 8 1>matches.txt
+./Rust/target/release/meshtastic_keygen_rs -s AAA -s ZZZ -t 8 1>matches.txt
 ```
 
 ### Performance comparison (C vs Rust)

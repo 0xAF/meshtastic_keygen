@@ -14,12 +14,12 @@ make debug      # builds meshtastic_keygen_debug with -g -O0
 ## Usage
 
 ```sh
-./meshtastic_keygen --search STR [--threads N] [--count C] [--affinity] [--quiet]
+./meshtastic_keygen --search STR [--search STR]... [--threads N] [--count C] [--affinity] [--quiet]
 # or
-./meshtastic_keygen -s STR [-t N] [-c C] [-q]
+./meshtastic_keygen -s STR [-s STR]... [-t N] [-c C] [-q]
 ```
 
-- `--search`, `-s` (required): Base64-only string [A-Za-z0-9+/] (no '='). Matches prefix or suffix `STR=`.
+- `--search`, `-s` (required): Base64-only string [A-Za-z0-9+/] (no '='). Can be repeated. Matches prefix or suffix `STR=`.
 - `--threads`, `-t`: worker threads (default 4)
 - `--count`, `-c`: stop after C matches (default 1)
 - `--quiet`, `-q`: disable periodic reporting
@@ -37,8 +37,11 @@ make debug      # builds meshtastic_keygen_debug with -g -O0
 # Stop after 5 matching keys
 ./meshtastic_keygen -s 0xAF -c 5
 
+# Multiple patterns
+./meshtastic_keygen -s AAA -s ZZZ -t 12
+
 # Save only matches to a file (FOUND lines)
-./meshtastic_keygen -s 0xAF -t 12 1>matches.txt
+./meshtastic_keygen -s AAA -s ZZZ -t 12 1>matches.txt
 ```
 
 ## Notes

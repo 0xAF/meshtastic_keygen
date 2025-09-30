@@ -21,12 +21,12 @@ cargo build --release
 ## Usage
 
 ```sh
-./target/release/meshtastic_keygen_rs --search STR [--threads N] [--count C] [--quiet]
+./target/release/meshtastic_keygen_rs --search STR [--search STR]... [--threads N] [--count C] [--quiet]
 # or
-./target/release/meshtastic_keygen_rs -s STR [-t N] [-c C] [-q]
+./target/release/meshtastic_keygen_rs -s STR [-s STR]... [-t N] [-c C] [-q]
 ```
 
-- `--search`, `-s` (required): Prefix string to search for in Base64.
+- `--search`, `-s` (required): Prefix string to search for in Base64. Can be specified multiple times.
   - Must contain only Base64 characters: A–Z, a–z, 0–9, +, /
   - Do not include '='; the tool will also match the suffix `STR=` automatically.
 - `--threads`, `-t` (optional): Worker threads. Default: 4.
@@ -46,7 +46,7 @@ cargo build --release
 ./target/release/meshtastic_keygen_rs -s 0xAF -t 12 -q
 
 # Save only matches to a file (FOUND lines)
-./target/release/meshtastic_keygen_rs -s 0xAF -t 12 1>matches.txt 
+./target/release/meshtastic_keygen_rs -s AAA -s ZZZ -t 12 1>matches.txt
 
 Notes:
 - `FOUND:` lines are emitted to both stdout and stderr for visibility while redirecting stdout to a file. Other messages (start, stats, summary) go to stderr.

@@ -40,11 +40,17 @@
 
 // Runtime-configurable settings
 static int g_num_threads = DEFAULT_NUM_THREADS;
-static char *g_target_prefix = NULL;
-static char *g_target_suffix = NULL; // prefix with '=' appended
-static size_t g_prefix_len = 0;
-static size_t g_suffix_len = 0;
-static size_t g_suffix_off = 0; // BASE64_LEN - g_suffix_len
+// Multiple search patterns support
+struct search_pattern {
+	char *prefix;
+	char *suffix; // prefix + '='
+	size_t prefix_len;
+	size_t suffix_len;
+	size_t suffix_off; // BASE64_LEN - suffix_len
+};
+static struct search_pattern *g_patterns = NULL;
+static size_t g_patterns_count = 0;
+static size_t g_patterns_cap = 0;
 static int g_affinity = 0; // pin worker threads to CPUs
 static int g_quiet = 0;    // disable periodic reporting
 
@@ -149,8 +155,16 @@ void *generate_keys(void *arg) {
 			local_cnt = 0;
 		}
 
-		if ((g_prefix_len > 0 && memcmp(b64_pub, g_target_prefix, g_prefix_len) == 0) ||
-			(g_suffix_len > 0 && memcmp(b64_pub + g_suffix_off, g_target_suffix, g_suffix_len) == 0)) {
+		int matched = 0;
+		for (size_t i = 0; i < g_patterns_count; ++i) {
+			struct search_pattern *sp = &g_patterns[i];
+			if ((sp->prefix_len > 0 && memcmp(b64_pub, sp->prefix, sp->prefix_len) == 0) ||
+				(sp->suffix_len > 0 && memcmp(b64_pub + sp->suffix_off, sp->suffix, sp->suffix_len) == 0)) {
+				matched = 1;
+				break;
+			}
+		}
+		if (matched) {
 			// Encode private key only when we have a match
 			base64_encode_32(priv_key, b64_priv);
 			printf("FOUND: pub=%s priv=%s\n", b64_pub, b64_priv);
@@ -184,30 +198,34 @@ static int search_has_only_b64_chars(const char *s) {
 	return 1;
 }
 
-static int set_search_string(const char *s) {
+static int add_search_string(const char *s) {
 	if (!s) return -1;
-	// Free existing
-	if (g_target_prefix) { free(g_target_prefix); g_target_prefix = NULL; }
-	if (g_target_suffix) { free(g_target_suffix); g_target_suffix = NULL; }
-
-	g_target_prefix = strdup(s);
-	if (!g_target_prefix) return -1;
-	g_prefix_len = strlen(g_target_prefix);
-
-	// suffix is prefix + '='
-	g_target_suffix = (char *)malloc(g_prefix_len + 2);
-	if (!g_target_suffix) { free(g_target_prefix); g_target_prefix = NULL; g_prefix_len = 0; return -1; }
-	memcpy(g_target_suffix, g_target_prefix, g_prefix_len);
-	g_target_suffix[g_prefix_len] = '=';
-	g_target_suffix[g_prefix_len + 1] = '\0';
-	g_suffix_len = g_prefix_len + 1;
-	g_suffix_off = (g_suffix_len <= BASE64_LEN) ? (BASE64_LEN - g_suffix_len) : 0;
+	if (g_patterns_count == g_patterns_cap) {
+		size_t new_cap = g_patterns_cap ? g_patterns_cap * 2 : 4;
+		void *np = realloc(g_patterns, new_cap * sizeof(*g_patterns));
+		if (!np) return -1;
+		g_patterns = (struct search_pattern *)np;
+		g_patterns_cap = new_cap;
+	}
+	struct search_pattern *p = &g_patterns[g_patterns_count];
+	memset(p, 0, sizeof(*p));
+	p->prefix = strdup(s);
+	if (!p->prefix) return -1;
+	p->prefix_len = strlen(p->prefix);
+	p->suffix = (char *)malloc(p->prefix_len + 2);
+	if (!p->suffix) { free(p->prefix); p->prefix = NULL; return -1; }
+	memcpy(p->suffix, p->prefix, p->prefix_len);
+	p->suffix[p->prefix_len] = '=';
+	p->suffix[p->prefix_len + 1] = '\0';
+	p->suffix_len = p->prefix_len + 1;
+	p->suffix_off = (p->suffix_len <= BASE64_LEN) ? (BASE64_LEN - p->suffix_len) : 0;
+	g_patterns_count++;
 	return 0;
 }
 
 static void print_usage(const char *prog) {
-	fprintf(stderr, "Usage: %s [-t N|--threads N] [-s STR|--search STR] [-c N|--count N] [--affinity] [-q|--quiet]\n", prog);
-	fprintf(stderr, "  -s STR: required. STR must contain only Base64 characters [A-Za-z0-9+/] (no '=').\n");
+	fprintf(stderr, "Usage: %s [-t N|--threads N] [-s STR|--search STR]... [-c N|--count N] [--affinity] [-q|--quiet]\n", prog);
+	fprintf(stderr, "  -s STR: required (can be repeated). STR must contain only Base64 characters [A-Za-z0-9+/] (no '=').\n");
 	fprintf(stderr, "  -t N  : optional. Number of threads (default %d).\n", DEFAULT_NUM_THREADS);
 	fprintf(stderr, "  -c N  : optional. Stop after finding N matches (default 1).\n");
 	fprintf(stderr, "  -q, --quiet: optional. Disable periodic reporting.\n");
@@ -271,7 +289,7 @@ int main(int argc, char **argv) {
 					print_usage(argv[0]);
 					return 1;
 				}
-				if (set_search_string(optarg) != 0) { fprintf(stderr, "Failed to set search string\n"); return 1; }
+				if (add_search_string(optarg) != 0) { fprintf(stderr, "Failed to add search string\n"); return 1; }
 				break;
 			case 'c': {
 				long long n = strtoll(optarg, NULL, 10);
@@ -294,9 +312,9 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	// Require search string
-	if (!g_target_prefix || g_prefix_len == 0) {
-		fprintf(stderr, "Error: missing required --search|-s STRING option.\n");
+	// Require at least one search string
+	if (g_patterns_count == 0) {
+		fprintf(stderr, "Error: missing required --search|-s STRING option (can be specified multiple times).\n");
 		print_usage(argv[0]);
 		return 1;
 	}
@@ -331,8 +349,13 @@ int main(int argc, char **argv) {
 	}
 	free(threads);
 	// Free search strings (unreachable in normal run)
-	free(g_target_prefix);
-	free(g_target_suffix);
+	if (g_patterns) {
+		for (size_t i = 0; i < g_patterns_count; ++i) {
+			free(g_patterns[i].prefix);
+			free(g_patterns[i].suffix);
+		}
+		free(g_patterns);
+	}
     
 	// Final summary
 	struct timespec ts_end;
