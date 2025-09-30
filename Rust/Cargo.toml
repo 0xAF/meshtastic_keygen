@@ -1,0 +1,18 @@
+[package]
+name = "meshtastic_keygen_rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["0xAF"]
+license = "WTFPL"
+
+[dependencies]
+rand = { version = "0.8", features = ["small_rng"] }
+base64 = "0.22"
+ctrlc = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

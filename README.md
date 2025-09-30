@@ -2,6 +2,11 @@
 
 A multi-threaded X25519 private key generator/search tool targeting Base64 prefixes/suffixes. Uses OpenSSL for keygen and Base64, and reports throughput once per second.
 
+## Implementations
+
+- C version: see `C/` (build and usage: `C/README.md`)
+- Rust version: see `rust/` (build and usage: `rust/README.md`)
+
 ## Features
 
 - Generates raw X25519 private keys and Base64-encodes them
@@ -11,14 +16,39 @@ A multi-threaded X25519 private key generator/search tool targeting Base64 prefi
 
 ## Build
 
-Requires OpenSSL (libssl and libcrypto) and pthreads.
+There are two implementations:
+
+- C version in `C/` (depends on OpenSSL and pthreads)
+- Rust version in `Rust/` (pure Rust)
+
+Top-level convenience targets build the C version:
 
 ```sh
-make            # builds `meshtastic_keygen`
-make debug      # builds `meshtastic_keygen_debug` with -g -O0
+make            # builds C/meshtastic_keygen
+make debug      # builds C/meshtastic_keygen_debug with -g -O0
 ```
 
-## Usage
+Or build directly in subfolders.
+
+### Rust version (Rust/)
+
+A highly optimized Rust implementation is available under `Rust/`.
+
+Build and run (release mode recommended):
+
+```sh
+cd Rust
+cargo build --release
+cargo run --release -- -s 0xAF -t 8 -c 2
+```
+
+Key differences vs C version:
+
+- Uses Rust’s SmallRng and zero-allocation Base64 encoding into a fixed buffer
+- Lock-free atomics for counters, clean shutdown via Ctrl-C
+- Similar CLI: `-s/--search`, `-t/--threads`, `-c/--count`
+
+## Usage (C version)
 
 ```sh
 ./meshtastic_keygen --search STR [--threads N] [--count C]
@@ -50,6 +80,26 @@ make debug      # builds `meshtastic_keygen_debug` with -g -O0
 
 - Periodic stats once per second: `Keys: total=1.23M, 456K/s`
 - Matches: `FOUND: <base64>`
+
+### Output comparison (C vs Rust)
+
+```text
+# C version (meshtastic_keygen)
+Starting key generation with 8 threads...
+Keys: total=733K, 367K/s
+FOUND: Q0xGdlpBQkM0Rk1yS1p5M0pzSjY4M0Y2WmE9
+
+# Rust version (Rust/meshtastic_keygen_rs)
+Start: 2025-10-01 12:34:56+00:00
+Keys: total=732K, 366K/s
+FOUND: Q0xGdlpBQkM0Rk1yS1p5M0pzSjY4M0Y2WmE9
+Done. Elapsed: 3.002s | total keys: 2.19M | found: 1 | rate: 730K/s
+```
+
+Notes:
+
+- Exact numbers will vary by CPU and flags. The Rust build above used `--release`.
+- The Rust version prints a start timestamp and a final summary line.
 
 ## Notes
 
