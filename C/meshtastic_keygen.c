@@ -84,8 +84,8 @@ static void *reporter(void *arg) {
 		human_readable_ull(total, total_str, sizeof total_str);
 		unsigned long long per_sec = delta / 5ULL;
 		human_readable_ull(per_sec, rate_str, sizeof rate_str);
-		printf("Keys: total=%s, %s/s\n", total_str, rate_str);
-		fflush(stdout);
+	fprintf(stderr, "Keys: total=%s, %s/s\n", total_str, rate_str);
+	fflush(stderr);
 	}
 	return NULL;
 }
@@ -154,7 +154,9 @@ void *generate_keys(void *arg) {
 			// Encode private key only when we have a match
 			base64_encode_32(priv_key, b64_priv);
 			printf("FOUND: pub=%s priv=%s\n", b64_pub, b64_priv);
+			fprintf(stderr, "FOUND: pub=%s priv=%s\n", b64_pub, b64_priv);
 			fflush(stdout);
+			fflush(stderr);
 			unsigned long long cur = atomic_fetch_add_explicit(&g_found_count, 1ULL, memory_order_relaxed) + 1ULL;
 			if (cur >= g_found_target) {
 				atomic_store_explicit(&g_stop, 1, memory_order_relaxed);
@@ -237,8 +239,8 @@ int main(int argc, char **argv) {
 		char buf[64];
 		localtime_r(&now, &tm);
 		strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S%z", &tm);
-		printf("Start: %s\n", buf);
-		fflush(stdout);
+	fprintf(stderr, "Start: %s\n", buf);
+	fflush(stderr);
 	}
 
 	// Parse options
@@ -308,7 +310,7 @@ int main(int argc, char **argv) {
 	// Initialize OpenSSL PRNG (modern OpenSSL auto-inits). Keep for compatibility.
 	OPENSSL_init_crypto(0, NULL);
     
-	printf("Starting key generation with %d threads...\n", g_num_threads);
+	fprintf(stderr, "Starting key generation with %d threads...\n", g_num_threads);
     
 	// Create reporter thread unless quiet
 	if (!g_quiet) {
@@ -344,9 +346,9 @@ int main(int argc, char **argv) {
 	char rate_str[32];
 	human_readable_ull(total_final, total_str, sizeof total_str);
 	human_readable_ull(rate_ull, rate_str, sizeof rate_str);
-	printf("Done. Elapsed: %.3fs | total keys: %s | found: %llu | rate: %s/s\n",
-		   secs, total_str, found_final, rate_str);
-	fflush(stdout);
+    fprintf(stderr, "Done. Elapsed: %.3fs | total keys: %s | found: %llu | rate: %s/s\n",
+	    secs, total_str, found_final, rate_str);
+    fflush(stderr);
     
 	return 0;
 }

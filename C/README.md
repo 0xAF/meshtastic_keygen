@@ -32,14 +32,18 @@ make debug      # builds meshtastic_keygen_debug with -g -O0
 ./meshtastic_keygen -s 0xAF -t 12
 
 # Minimal: default 4 threads
-./meshtastic_keygen -s hello
+./meshtastic_keygen -s 0xAF
 
 # Stop after 5 matching keys
 ./meshtastic_keygen -s 0xAF -c 5
+
+# Save only matches to a file (FOUND lines)
+./meshtastic_keygen -s 0xAF -t 12 1>matches.txt
 ```
 
 ## Notes
 
+- `FOUND:` lines are printed to both stdout and stderr so you can watch for finds while redirecting stdout to a file. All other messages (start time, stats, final summary) are printed to stderr.
 - Prints stats every 5 seconds (rate shown as keys per second) in human-readable units
 - Emits a line per match: `FOUND: <base64>`
 - Uses OpenSSL 3 APIs (EVP_PKEY_X25519, get_raw_private_key).

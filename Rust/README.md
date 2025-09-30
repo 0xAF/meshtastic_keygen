@@ -45,6 +45,12 @@ cargo build --release
 # Quiet mode
 ./target/release/meshtastic_keygen_rs -s 0xAF -t 12 -q
 
+# Save only matches to a file (FOUND lines)
+./target/release/meshtastic_keygen_rs -s 0xAF -t 12 1>matches.txt 
+
+Notes:
+- `FOUND:` lines are emitted to both stdout and stderr for visibility while redirecting stdout to a file. Other messages (start, stats, summary) go to stderr.
+
 ```
 
 ## License

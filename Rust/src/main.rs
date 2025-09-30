@@ -144,7 +144,9 @@ fn worker(cfg: Arc<Config>, stop: Arc<AtomicBool>, total: Arc<AtomicU64>, found:
             debug_assert_eq!(n_priv, 44);
             let pub_str = std::str::from_utf8(enc).unwrap();
             let priv_str = std::str::from_utf8(&b64_priv[..n_priv]).unwrap();
-            safe_println(&format!("FOUND: pub={} priv={}", pub_str, priv_str));
+            let line = format!("FOUND: pub={} priv={}", pub_str, priv_str);
+            safe_println(&line);
+            safe_eprintln(&line);
             let c = found.fetch_add(1, Ordering::Relaxed) + 1;
             if c >= cfg.count {
                 stop.store(true, Ordering::Relaxed);
@@ -162,6 +164,12 @@ fn safe_println(line: &str) {
     let _ = writeln!(out, "{}", line);
 }
 
+#[inline]
+fn safe_eprintln(line: &str) {
+    let mut err = io::stderr();
+    let _ = writeln!(err, "{}", line);
+}
+
 fn main() {
     let cfg = match parse_args() {
         Ok(c) => Arc::new(c),
@@ -172,7 +180,7 @@ fn main() {
     let start_instant = std::time::Instant::now();
     let start_wall: chrono::DateTime<chrono::Local> = chrono::Local::now();
     // println!("Start: {}", start_wall.format("%Y-%m-%d %H:%M:%S%:z"));
-    safe_println(&format!("Start: {}", start_wall.format("%Y-%m-%d %H:%M:%S%:z")));
+    safe_eprintln(&format!("Start: {}", start_wall.format("%Y-%m-%d %H:%M:%S%:z")));
 
     let stop = Arc::new(AtomicBool::new(false));
     let total = Arc::new(AtomicU64::new(0));
@@ -197,7 +205,7 @@ fn main() {
                 let t = total_r.load(Ordering::Relaxed);
                 let d = t - last; last = t;
                 let per_sec = d / 5;
-                safe_println(&format!("Keys: total={}, {}/s", human(t), human(per_sec)));
+                safe_eprintln(&format!("Keys: total={}, {}/s", human(t), human(per_sec)));
             }
         }))
     } else { None };
@@ -225,7 +233,7 @@ fn main() {
     //     "Done. Elapsed: {:.3}s | total keys: {} | found: {} | rate: {}/s",
     //     secs, human(total_final), found_final, human((total_final as f64 / secs.max(1e-9)) as u64)
     // );
-    safe_println(&format!(
+    safe_eprintln(&format!(
         "Done. Elapsed: {:.3}s | total keys: {} | found: {} | rate: {}/s",
         secs, human(total_final), found_final, human((total_final as f64 / secs.max(1e-9)) as u64)
     ));
