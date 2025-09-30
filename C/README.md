@@ -27,4 +27,5 @@ make debug      # builds meshtastic_keygen_debug with -g -O0
 
 - Prints stats every second in human-readable units
 - Emits a line per match: `FOUND: <base64>`
-- License: WTFPL v2
+- Uses OpenSSL 3 APIs (EVP_PKEY_X25519, get_raw_private_key).
+- The process runs indefinitely; stop with Ctrl-C.
