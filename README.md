@@ -46,7 +46,7 @@ There are two implementations:
 
 ### Performance comparison (C vs Rust)
 
-- On my Intel(R) Core(TM) i7-14700K with 28 cores and running 28 threads:
+- On my Intel(R) Core(TM) i7-14700K with 28 cores and running 28 threads and looking for `0xAF`:
   - C: 780 K/s
   - Rust: 445 K/s
 
