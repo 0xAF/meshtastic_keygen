@@ -1,15 +1,14 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use chrono::{DateTime, Local};
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
+use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
 use std::env;
 use std::io::{self, Write};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration};
 
 const DEFAULT_THREADS: usize = 4;
 
@@ -93,16 +92,21 @@ fn worker(cfg: Arc<Config>, stop: Arc<AtomicBool>, total: Arc<AtomicU64>, found:
     // Pre-allocate buffers
     let mut rng = SmallRng::from_entropy();
     let mut sk = [0u8; 32];
-    let mut b64 = [0u8; 44]; // 32 -> 44 bytes with padding
+    let mut b64_pub = [0u8; 44];  // public b64
+    let mut b64_priv = [0u8; 44]; // private b64 (only used on match)
 
     while !stop.load(Ordering::Relaxed) {
-        rng.fill_bytes(&mut sk);
-        clamp_x25519_scalar(&mut sk);
-        let n = STANDARD.encode_slice(&sk, &mut b64).unwrap();
-        debug_assert_eq!(n, 44);
+    rng.fill_bytes(&mut sk);
+    clamp_x25519_scalar(&mut sk);
+    // Compute public key from private
+    let pub_bytes = x25519(sk, X25519_BASEPOINT_BYTES);
 
-        // Safety: buffer is ASCII; compare as bytes to avoid allocation
-        let enc = &b64[..n];
+    // Encode public key to base64
+    let n = STANDARD.encode_slice(&pub_bytes, &mut b64_pub).unwrap();
+    debug_assert_eq!(n, 44);
+
+    // Safety: buffer is ASCII; compare as bytes to avoid allocation
+    let enc = &b64_pub[..n];
         let prefix = cfg.search.as_bytes();
         let suffix = cfg.suffix.as_bytes();
 
@@ -111,9 +115,12 @@ fn worker(cfg: Arc<Config>, stop: Arc<AtomicBool>, total: Arc<AtomicU64>, found:
         let matches_prefix = enc.len() >= prefix.len() && &enc[..prefix.len()] == prefix;
         let matches_suffix = enc.len() >= suffix.len() && &enc[enc.len()-suffix.len()..] == suffix;
         if matches_prefix || matches_suffix {
-            // Print matching base64 line
-            // println!("FOUND: {}", std::str::from_utf8(enc).unwrap());
-            safe_println(&format!("FOUND: {}", std::str::from_utf8(enc).unwrap()));
+            // Encode private key only when needed and print both
+            let n_priv = STANDARD.encode_slice(&sk, &mut b64_priv).unwrap();
+            debug_assert_eq!(n_priv, 44);
+            let pub_str = std::str::from_utf8(enc).unwrap();
+            let priv_str = std::str::from_utf8(&b64_priv[..n_priv]).unwrap();
+            safe_println(&format!("FOUND: pub={} priv={}", pub_str, priv_str));
             let c = found.fetch_add(1, Ordering::Relaxed) + 1;
             if c >= cfg.count {
                 stop.store(true, Ordering::Relaxed);

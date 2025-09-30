@@ -10,6 +10,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 base64 = "0.22"
 ctrlc = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+x25519-dalek = { version = "2", default-features = true }
 
 [profile.release]
 opt-level = 3

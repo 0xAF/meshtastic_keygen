@@ -14,6 +14,8 @@
 	0. You just DO WHAT THE F*CK YOU WANT TO.
 */
 
+#define _POSIX_C_SOURCE 199309L
+
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/buffer.h>
@@ -26,6 +28,8 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <ctype.h>
+#include <time.h>
+#include <signal.h>
 
 #define DEFAULT_NUM_THREADS 4
 #define BASE64_LEN 44  // 32 bytes base64 encoded
@@ -125,7 +129,9 @@ unsigned char *base64_encode(const unsigned char *input, int length) {
 void *generate_keys(void *arg) {
 	EVP_PKEY_CTX *ctx;
 	unsigned char priv_key[32];
-	char *encoded;
+	unsigned char pub_key[32];
+	char *encoded_pub;
+	char *encoded_priv;
     
 	ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
 	if (!ctx) return NULL;
@@ -142,17 +148,23 @@ void *generate_keys(void *arg) {
 			continue;
 		}
         
-		// Extract private key (last 32 bytes)
+		// Extract private and public raw keys (32 bytes each)
 		size_t len = 32;
 		if (EVP_PKEY_get_raw_private_key(pkey, priv_key, &len) <= 0) {
 			EVP_PKEY_free(pkey);
 			pkey = NULL;
 			continue;
 		}
+		len = 32;
+		if (EVP_PKEY_get_raw_public_key(pkey, pub_key, &len) <= 0) {
+			EVP_PKEY_free(pkey);
+			pkey = NULL;
+			continue;
+		}
         
-		// Base64 encode
-		encoded = (char *)base64_encode(priv_key, 32);
-		if (!encoded) {
+		// Base64 encode public key (used for matching)
+		encoded_pub = (char *)base64_encode(pub_key, 32);
+		if (!encoded_pub) {
 			EVP_PKEY_free(pkey);
 			pkey = NULL;
 			continue;
@@ -161,18 +173,27 @@ void *generate_keys(void *arg) {
 		atomic_fetch_add(&g_key_count, 1ULL);
         
 		// Check if it starts with the prefix or ends with prefix + '='
-		size_t enc_len = strlen(encoded);
-		if ((g_prefix_len > 0 && strncmp(encoded, g_target_prefix, g_prefix_len) == 0) ||
-			(g_suffix_len > 0 && enc_len >= g_suffix_len && strcmp(encoded + enc_len - g_suffix_len, g_target_suffix) == 0)) {
-			printf("FOUND: %s\n", encoded);
+		size_t enc_len = strlen(encoded_pub);
+		if ((g_prefix_len > 0 && strncmp(encoded_pub, g_target_prefix, g_prefix_len) == 0) ||
+			(g_suffix_len > 0 && enc_len >= g_suffix_len && strcmp(encoded_pub + enc_len - g_suffix_len, g_target_suffix) == 0)) {
+			// Encode private key only when we have a match
+			encoded_priv = (char *)base64_encode(priv_key, 32);
+			if (!encoded_priv) {
+				free(encoded_pub);
+				EVP_PKEY_free(pkey);
+				pkey = NULL;
+				continue;
+			}
+			printf("FOUND: pub=%s priv=%s\n", encoded_pub, encoded_priv);
 			fflush(stdout);
 			unsigned long long cur = atomic_fetch_add(&g_found_count, 1ULL) + 1ULL;
 			if (cur >= g_found_target) {
 				atomic_store(&g_stop, 1);
 			}
+			free(encoded_priv);
 		}
         
-		free(encoded);
+		free(encoded_pub);
 		EVP_PKEY_free(pkey);
 		pkey = NULL;
 	}
@@ -223,10 +244,32 @@ static void print_usage(const char *prog) {
 
 void *generate_keys(void *arg);
 
+static void handle_signal(int sig) {
+	(void)sig;
+	atomic_store(&g_stop, 1);
+}
+
 int main(int argc, char **argv) {
 	pthread_t *threads = NULL;
 	pthread_t rpt;
 	// Defaults: no search string, require via CLI; threads default to DEFAULT_NUM_THREADS
+	struct timespec ts_start;
+	clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
+	// Install signal handlers for graceful shutdown (Ctrl-C)
+	signal(SIGINT, handle_signal);
+	signal(SIGTERM, handle_signal);
+
+	// Print start wall-clock timestamp
+	{
+		time_t now = time(NULL);
+		struct tm tm;
+		char buf[64];
+		localtime_r(&now, &tm);
+		strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S%z", &tm);
+		printf("Start: %s\n", buf);
+		fflush(stdout);
+	}
 
 	// Parse options
 	static struct option long_opts[] = {
@@ -306,6 +349,22 @@ int main(int argc, char **argv) {
 	// Free search strings (unreachable in normal run)
 	free(g_target_prefix);
 	free(g_target_suffix);
+    
+	// Final summary
+	struct timespec ts_end;
+	clock_gettime(CLOCK_MONOTONIC, &ts_end);
+	double secs = (ts_end.tv_sec - ts_start.tv_sec) + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
+	if (secs < 0) secs = 0;
+	unsigned long long total_final = atomic_load(&g_key_count);
+	unsigned long long found_final = atomic_load(&g_found_count);
+	unsigned long long rate_ull = (unsigned long long)((total_final / (secs > 1e-9 ? secs : 1e-9)) + 0.5);
+	char total_str[32];
+	char rate_str[32];
+	human_readable_ull(total_final, total_str, sizeof total_str);
+	human_readable_ull(rate_ull, rate_str, sizeof rate_str);
+	printf("Done. Elapsed: %.3fs | total keys: %s | found: %llu | rate: %s/s\n",
+		   secs, total_str, found_final, rate_str);
+	fflush(stdout);
     
 	return 0;
 }

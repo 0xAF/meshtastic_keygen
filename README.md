@@ -21,7 +21,7 @@ There are two implementations:
 - C version in `C/` (depends on OpenSSL and pthreads)
 - Rust version in `Rust/` (pure Rust)
 
-## Key differences vs C version:
+## Key differences in Rust vs C version:
 
 - Uses Rust’s SmallRng and zero-allocation Base64 encoding into a fixed buffer
 - Lock-free atomics for counters, clean shutdown via Ctrl-C
@@ -36,7 +36,7 @@ There are two implementations:
 
 - On my Intel(R) Core(TM) i7-14700K with 28 cores and running 28 threads:
   - C: 770**K**/s
-  - Rust: 53**M**/s
+  - Rust: 410**K**/s
 
 ## License
 
