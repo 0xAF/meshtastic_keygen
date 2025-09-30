@@ -14,6 +14,7 @@ A multi-threaded X25519 private key generator/search tool targeting Base64 prefi
 - Multi-threaded (user configurable)
 - Periodic stats (every 5s by default): total keys and keys/sec (per-second rate) in human-readable units
 - Quiet mode (-q/--quiet) to disable periodic reporting
+- Optional visually-better variants (-b/--better): for each -s STR, only check STR/, STR+, /STR=, +STR= (skip base STR/STR=)
 
 ## Build
 
@@ -34,6 +35,21 @@ There are two implementations:
 - Matches: `FOUND: <base64>`
 - Multiple patterns: pass -s/--search multiple times; each key is matched against all patterns (prefix and suffix with '=').
 - Output streams: `FOUND:` lines go to both stdout and stderr; all other messages (start, stats, summary) go to stderr. This lets you redirect stdout to capture just matches while still seeing finds in your terminal.
+
+## Options (C and Rust)
+
+- Required:
+  - -s, --search STR (repeatable): Base64-only string [A-Za-z0-9+/], no '='. Each STR matches either:
+    - Prefix: Base64(public) starts with STR; and
+    - Suffix: Base64(public) ends with STR=
+- Optional:
+  - -t, --threads N: Number of worker threads (default 4)
+  - -c, --count C: Stop after finding C matches (default 1)
+  - -q, --quiet: Disable periodic reporting (5s stats)
+  - --affinity (C) / --affinity (Rust): Pin worker threads to CPU cores (Linux)
+  - -b, --better: Only search “visually better” variants for each STR, skipping the base STR/STR=
+    - Prefix variants: STR/ and STR+
+    - Suffix variants: /STR= and +STR=
 
 ### Redirecting output
 

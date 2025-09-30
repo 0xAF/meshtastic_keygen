@@ -14,22 +14,30 @@ make debug      # builds meshtastic_keygen_debug with -g -O0
 ## Usage
 
 ```sh
-./meshtastic_keygen --search STR [--search STR]... [--threads N] [--count C] [--affinity] [--quiet]
+./meshtastic_keygen --search STR [--search STR]... [--threads N] [--count C] [--affinity] [--quiet] [--better]
 # or
-./meshtastic_keygen -s STR [-s STR]... [-t N] [-c C] [-q]
+./meshtastic_keygen -s STR [-s STR]... [-t N] [-c C] [-q] [-b]
 ```
 
-- `--search`, `-s` (required): Base64-only string [A-Za-z0-9+/] (no '='). Can be repeated. Matches prefix or suffix `STR=`.
-- `--threads`, `-t`: worker threads (default 4)
-- `--count`, `-c`: stop after C matches (default 1)
-- `--quiet`, `-q`: disable periodic reporting
-- `--affinity`: pin worker threads to CPU cores (Linux)
+- Options:
+  - `--search`, `-s` (required, repeatable): Base64-only string [A-Za-z0-9+/] (no '='). When used without `-b`, matches prefix `STR` or suffix `STR=`.
+  - `--threads`, `-t`: Worker threads (default 4)
+  - `--count`, `-c`: Stop after C matches (default 1)
+  - `--quiet`, `-q`: Disable periodic reporting (5s stats)
+  - `--affinity`: Pin worker threads to CPU cores (Linux)
+  - `--better`, `-b`: Only search for "visually better" adjacent variants around your pattern (the base `STR` and `STR=` are skipped):  
+    This keeps the requested `STR` but nudges it with Base64 boundary characters for nicer-looking keys.
+    - Prefix variants: `STR/` and `STR+`
+    - Suffix variants: `/STR=` and `+STR=`
 
 ### Examples
 
 ```sh
 # Search for Base64 values that start with 0xAF or end with 0xAF=
 ./meshtastic_keygen -s 0xAF -t 12
+
+# Only variants: match 0xAF/ and 0xAF+ (prefix), and /0xAF= and +0xAF= (suffix)
+./meshtastic_keygen -s 0xAF -b -t 12
 
 # Minimal: default 4 threads
 ./meshtastic_keygen -s 0xAF

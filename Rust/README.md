@@ -21,9 +21,9 @@ cargo build --release
 ## Usage
 
 ```sh
-./target/release/meshtastic_keygen_rs --search STR [--search STR]... [--threads N] [--count C] [--quiet]
+./target/release/meshtastic_keygen_rs --search STR [--search STR]... [--threads N] [--count C] [--quiet] [--better] [--affinity]
 # or
-./target/release/meshtastic_keygen_rs -s STR [-s STR]... [-t N] [-c C] [-q]
+./target/release/meshtastic_keygen_rs -s STR [-s STR]... [-t N] [-c C] [-q] [-b]
 ```
 
 - `--search`, `-s` (required): Prefix string to search for in Base64. Can be specified multiple times.
@@ -31,13 +31,20 @@ cargo build --release
   - Do not include '='; the tool will also match the suffix `STR=` automatically.
 - `--threads`, `-t` (optional): Worker threads. Default: 4.
 - `--count`, `-c` (optional): Stop after finding C matches. Default: 1.
-- `--quiet`, `-q` (optional): Disable periodic reporting.
+- `--quiet`, `-q` (optional): Disable periodic reporting (5s stats).
+- `--better`, `-b` (optional): Only match adjacent variants for nicer keys (base `STR` and `STR=` skipped):
+  - Prefix variants: `STR/` and `STR+`
+  - Suffix variants: `/STR=` and `+STR=`
+- `--affinity` (optional): Pin worker threads to CPU cores (Linux)
 
 ### Examples
 
 ```sh
 # Start 12 threads looking for 0xAF prefix or suffix 0xAF=
 ./target/release/meshtastic_keygen_rs -s 0xAF -t 12
+
+# Only visually better variants (prefix: 0xAF/ and 0xAF+; suffix: /0xAF= and +0xAF=)
+./target/release/meshtastic_keygen_rs -s 0xAF -b -t 12
 
 # Stop after 5 matches
 ./target/release/meshtastic_keygen_rs -s 0xAF -c 5

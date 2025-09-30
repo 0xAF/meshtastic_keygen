@@ -50,6 +50,7 @@ fn parse_args() -> Result<Config, String> {
     let mut count: u64 = 1;
     let mut quiet: bool = false;
     let mut affinity: bool = false;
+    let mut better: bool = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -74,6 +75,9 @@ fn parse_args() -> Result<Config, String> {
             "--affinity" => {
                 affinity = true;
             }
+            "-b" | "--better" => {
+                better = true;
+            }
             "-h" | "--help" => {
                 print_usage(&args[0]);
                 std::process::exit(0);
@@ -84,14 +88,36 @@ fn parse_args() -> Result<Config, String> {
     }
 
     if searches.is_empty() { return Err("--search is required (can be specified multiple times)".into()); }
-    let mut patterns = Vec::with_capacity(searches.len());
+    let mut patterns = Vec::with_capacity(searches.len() * if better { 4 } else { 1 });
     for s in searches {
         if !is_base64_search(&s) { return Err("search must contain only Base64 chars [A-Za-z0-9+/]".into()); }
         let prefix = s.into_bytes();
-        let mut suffix = prefix.clone();
-        suffix.push(b'=');
-        let suffix_off = if suffix.len() <= 44 { 44 - suffix.len() } else { 0 };
-        patterns.push(Pattern { prefix, suffix, suffix_off });
+        if better {
+            // Only variants with --better: do not include base prefix/suffix
+            let mut suffix = prefix.clone();
+            suffix.push(b'=');
+            // Prefix variants: s+"/" and s"+"
+            let mut pre1 = prefix.clone(); pre1.push(b'/');
+            let mut pre2 = prefix.clone(); pre2.push(b'+');
+            patterns.push(Pattern { prefix: pre1, suffix: Vec::new(), suffix_off: 0 });
+            patterns.push(Pattern { prefix: pre2, suffix: Vec::new(), suffix_off: 0 });
+
+            // Suffix variants: "/"+s+"=" and "+"+s+"="
+            let mut suf1 = Vec::with_capacity(suffix.len() + 1);
+            suf1.push(b'/'); suf1.extend_from_slice(&prefix); suf1.push(b'=');
+            let mut suf2 = Vec::with_capacity(suffix.len() + 1);
+            suf2.push(b'+'); suf2.extend_from_slice(&prefix); suf2.push(b'=');
+            let off1 = if suf1.len() <= 44 { 44 - suf1.len() } else { 0 };
+            let off2 = if suf2.len() <= 44 { 44 - suf2.len() } else { 0 };
+            patterns.push(Pattern { prefix: Vec::new(), suffix: suf1, suffix_off: off1 });
+            patterns.push(Pattern { prefix: Vec::new(), suffix: suf2, suffix_off: off2 });
+        } else {
+            // Base pattern when not --better
+            let mut suffix = prefix.clone();
+            suffix.push(b'=');
+            let suffix_off = if suffix.len() <= 44 { 44 - suffix.len() } else { 0 };
+            patterns.push(Pattern { prefix: prefix.clone(), suffix: suffix.clone(), suffix_off });
+        }
     }
 
     Ok(Config { threads, patterns, count, quiet, affinity })
@@ -99,7 +125,7 @@ fn parse_args() -> Result<Config, String> {
 
 fn print_usage(prog: &str) {
     eprintln!(
-        "Usage: {} -s STR [-s STR]... [-t N] [-c C] [-q] [--affinity]\n  -s, --search  STR: Base64 chars only [A-Za-z0-9+/] (no '='); can be given multiple times\n  -t, --threads N  : worker threads (default {})\n  -c, --count   C  : stop after C matches (default 1)\n  -q, --quiet      : disable periodic reporting\n      --affinity   : pin worker threads to CPU cores",
+        "Usage: {} -s STR [-s STR]... [-t N] [-c C] [-q] [-b] [--affinity]\n  -s, --search  STR: Base64 chars only [A-Za-z0-9+/] (no '='); can be given multiple times\n  -t, --threads N  : worker threads (default {})\n  -c, --count   C  : stop after C matches (default 1)\n  -q, --quiet      : disable periodic reporting\n  -b, --better     : only match visually tighter variants: prefix STR/ and STR+; suffix /STR= and +STR= (base STR/STR= skipped)\n      --affinity   : pin worker threads to CPU cores",
         prog, DEFAULT_THREADS
     );
 }
@@ -149,8 +175,8 @@ fn worker(cfg: Arc<Config>, stop: Arc<AtomicBool>, total: Arc<AtomicU64>, found:
 
         let mut matches_any = false;
         for p in &patterns {
-            if (enc.len() >= p.prefix.len() && &enc[..p.prefix.len()] == &*p.prefix) ||
-               (enc.len() >= p.suffix.len() && &enc[p.suffix_off..] == &*p.suffix) {
+            if ((p.prefix.len() > 0) && enc.len() >= p.prefix.len() && &enc[..p.prefix.len()] == &*p.prefix) ||
+               ((p.suffix.len() > 0) && enc.len() >= p.suffix.len() && &enc[p.suffix_off..] == &*p.suffix) {
                 matches_any = true; break;
             }
         }
@@ -208,6 +234,25 @@ fn main() {
         ctrlc::set_handler(move || {
             stop_c.store(true, Ordering::Relaxed);
         }).expect("failed to set Ctrl-C handler");
+    }
+
+    // Print search patterns (prefixes and suffixes)
+    {
+        let mut prefixes: Vec<&[u8]> = Vec::new();
+        let mut suffixes: Vec<&[u8]> = Vec::new();
+        for p in &cfg.patterns {
+            if !p.prefix.is_empty() { prefixes.push(&p.prefix); }
+            if !p.suffix.is_empty() { suffixes.push(&p.suffix); }
+        }
+        safe_eprintln(&format!(
+            "Search patterns:\n  Prefixes ({}): {}\n  Suffixes ({}): {}",
+            prefixes.len(),
+            prefixes.iter().map(|b| std::str::from_utf8(b).unwrap_or("?"))
+                .collect::<Vec<_>>().join(", "),
+            suffixes.len(),
+            suffixes.iter().map(|b| std::str::from_utf8(b).unwrap_or("?"))
+                .collect::<Vec<_>>().join(", ")
+        ));
     }
 
     // Reporter thread (5s interval, per-second rate)

@@ -53,6 +53,7 @@ static size_t g_patterns_count = 0;
 static size_t g_patterns_cap = 0;
 static int g_affinity = 0; // pin worker threads to CPUs
 static int g_quiet = 0;    // disable periodic reporting
+static int g_better = 0;   // add visually better variants for patterns
 
 static _Atomic unsigned long long g_key_count = 0; // total generated/checked keys
 static _Atomic unsigned long long g_found_count = 0; // total matches found
@@ -198,8 +199,8 @@ static int search_has_only_b64_chars(const char *s) {
 	return 1;
 }
 
-static int add_search_string(const char *s) {
-	if (!s) return -1;
+static int add_pattern(const char *prefix_opt, const char *suffix_opt) {
+	if (!prefix_opt && !suffix_opt) return -1;
 	if (g_patterns_count == g_patterns_cap) {
 		size_t new_cap = g_patterns_cap ? g_patterns_cap * 2 : 4;
 		void *np = realloc(g_patterns, new_cap * sizeof(*g_patterns));
@@ -209,27 +210,68 @@ static int add_search_string(const char *s) {
 	}
 	struct search_pattern *p = &g_patterns[g_patterns_count];
 	memset(p, 0, sizeof(*p));
-	p->prefix = strdup(s);
-	if (!p->prefix) return -1;
-	p->prefix_len = strlen(p->prefix);
-	p->suffix = (char *)malloc(p->prefix_len + 2);
-	if (!p->suffix) { free(p->prefix); p->prefix = NULL; return -1; }
-	memcpy(p->suffix, p->prefix, p->prefix_len);
-	p->suffix[p->prefix_len] = '=';
-	p->suffix[p->prefix_len + 1] = '\0';
-	p->suffix_len = p->prefix_len + 1;
-	p->suffix_off = (p->suffix_len <= BASE64_LEN) ? (BASE64_LEN - p->suffix_len) : 0;
+	if (prefix_opt) {
+		p->prefix = strdup(prefix_opt);
+		if (!p->prefix) return -1;
+		p->prefix_len = strlen(p->prefix);
+	}
+	if (suffix_opt) {
+		p->suffix = strdup(suffix_opt);
+		if (!p->suffix) return -1;
+		p->suffix_len = strlen(p->suffix);
+		p->suffix_off = (p->suffix_len <= BASE64_LEN) ? (BASE64_LEN - p->suffix_len) : 0;
+	}
 	g_patterns_count++;
 	return 0;
 }
 
+static int add_search_string(const char *s) {
+	if (!s) return -1;
+	size_t slen = strlen(s);
+	int rc = 0;
+	if (!g_better) {
+		// Base pattern: prefix=s, suffix=s"="
+		char *suf = (char *)malloc(slen + 2);
+		if (!suf) return -1;
+		memcpy(suf, s, slen);
+		suf[slen] = '=';
+		suf[slen + 1] = '\0';
+		rc = add_pattern(s, suf);
+		free(suf);
+		if (rc != 0) return rc;
+	} else {
+		// Only add visually-better variants
+		// Prefix variants: s+"/" and s"+"
+		char *pre1 = (char *)malloc(slen + 2);
+		char *pre2 = (char *)malloc(slen + 2);
+		if (!pre1 || !pre2) { free(pre1); free(pre2); return -1; }
+		memcpy(pre1, s, slen); pre1[slen] = '/'; pre1[slen + 1] = '\0';
+		memcpy(pre2, s, slen); pre2[slen] = '+'; pre2[slen + 1] = '\0';
+		rc = add_pattern(pre1, NULL); if (rc == 0) rc = add_pattern(pre2, NULL);
+		free(pre1); free(pre2);
+		if (rc != 0) return rc;
+
+		// Suffix variants: "/"+s+"=" and "+"+s+"="
+		char *suf1 = (char *)malloc(slen + 2 + 1);
+		char *suf2 = (char *)malloc(slen + 2 + 1);
+		if (!suf1 || !suf2) { free(suf1); free(suf2); return -1; }
+		suf1[0] = '/'; memcpy(suf1 + 1, s, slen); suf1[1 + slen] = '='; suf1[1 + slen + 1] = '\0';
+		suf2[0] = '+'; memcpy(suf2 + 1, s, slen); suf2[1 + slen] = '='; suf2[1 + slen + 1] = '\0';
+		rc = add_pattern(NULL, suf1); if (rc == 0) rc = add_pattern(NULL, suf2);
+		free(suf1); free(suf2);
+		if (rc != 0) return rc;
+	}
+	return 0;
+}
+
 static void print_usage(const char *prog) {
-	fprintf(stderr, "Usage: %s [-t N|--threads N] [-s STR|--search STR]... [-c N|--count N] [--affinity] [-q|--quiet]\n", prog);
+	fprintf(stderr, "Usage: %s [-t N|--threads N] [-s STR|--search STR]... [-c N|--count N] [--affinity] [-q|--quiet] [-b|--better]\n", prog);
 	fprintf(stderr, "  -s STR: required (can be repeated). STR must contain only Base64 characters [A-Za-z0-9+/] (no '=').\n");
 	fprintf(stderr, "  -t N  : optional. Number of threads (default %d).\n", DEFAULT_NUM_THREADS);
 	fprintf(stderr, "  -c N  : optional. Stop after finding N matches (default 1).\n");
 	fprintf(stderr, "  -q, --quiet: optional. Disable periodic reporting.\n");
 	fprintf(stderr, "  --affinity: optional. Pin worker threads to CPU cores (Linux).\n");
+	fprintf(stderr, "  -b, --better: optional. Only match visually tighter variants: prefix STR/ and STR+; suffix /STR= and +STR=. (Base STR/STR= are skipped.)\n");
 }
 
 void *generate_keys(void *arg);
@@ -262,16 +304,20 @@ int main(int argc, char **argv) {
 	}
 
 	// Parse options
+	// Collect search strings first to apply -b consistently regardless of option order
+	char **searches = NULL;
+	size_t searches_count = 0, searches_cap = 0;
 	static struct option long_opts[] = {
 		{"threads", required_argument, 0, 't'},
 		{"search",  required_argument, 0, 's'},
 		{"count",   required_argument, 0, 'c'},
 		{"affinity", no_argument,       0,  1 },
 		{"quiet",    no_argument,       0, 'q'},
+		{"better",   no_argument,       0, 'b'},
 		{0, 0, 0, 0}
 	};
 	int opt, idx;
-	while ((opt = getopt_long(argc, argv, "t:s:c:q", long_opts, &idx)) != -1) {
+	while ((opt = getopt_long(argc, argv, "t:s:c:qb", long_opts, &idx)) != -1) {
 		switch (opt) {
 			case 't': {
 				long n = strtol(optarg, NULL, 10);
@@ -289,7 +335,15 @@ int main(int argc, char **argv) {
 					print_usage(argv[0]);
 					return 1;
 				}
-				if (add_search_string(optarg) != 0) { fprintf(stderr, "Failed to add search string\n"); return 1; }
+				if (searches_count == searches_cap) {
+					size_t new_cap = searches_cap ? searches_cap * 2 : 4;
+					char **tmp = (char **)realloc(searches, new_cap * sizeof(*searches));
+					if (!tmp) { fprintf(stderr, "Out of memory\n"); return 1; }
+					searches = tmp; searches_cap = new_cap;
+				}
+				searches[searches_count] = strdup(optarg);
+				if (!searches[searches_count]) { fprintf(stderr, "Out of memory\n"); return 1; }
+				searches_count++;
 				break;
 			case 'c': {
 				long long n = strtoll(optarg, NULL, 10);
@@ -306,17 +360,61 @@ int main(int argc, char **argv) {
 			case 'q':
 				g_quiet = 1;
 				break;
+			case 'b':
+				g_better = 1;
+				break;
 			default:
 				print_usage(argv[0]);
 				return 1;
 		}
 	}
 
-	// Require at least one search string
-	if (g_patterns_count == 0) {
+	// After parsing, create search patterns from collected strings (respects -b)
+	if (searches_count == 0) {
 		fprintf(stderr, "Error: missing required --search|-s STRING option (can be specified multiple times).\n");
 		print_usage(argv[0]);
 		return 1;
+	}
+	for (size_t i = 0; i < searches_count; ++i) {
+		if (add_search_string(searches[i]) != 0) { fprintf(stderr, "Failed to add search string\n"); return 1; }
+	}
+	for (size_t i = 0; i < searches_count; ++i) free(searches[i]);
+	free(searches);
+
+	// Print search patterns (prefixes and suffixes)
+	{
+		// Count and print prefixes
+		size_t pcount = 0, scount = 0;
+		for (size_t i = 0; i < g_patterns_count; ++i) {
+			if (g_patterns[i].prefix_len > 0) pcount++;
+			if (g_patterns[i].suffix_len > 0) scount++;
+		}
+		fprintf(stderr, "Search patterns:\n");
+		fprintf(stderr, "  Prefixes (%zu): ", pcount);
+		{
+			int first = 1;
+			for (size_t i = 0; i < g_patterns_count; ++i) {
+				if (g_patterns[i].prefix_len > 0 && g_patterns[i].prefix) {
+					if (!first) fprintf(stderr, ", ");
+					fwrite(g_patterns[i].prefix, 1, g_patterns[i].prefix_len, stderr);
+					first = 0;
+				}
+			}
+			fprintf(stderr, "\n");
+		}
+		fprintf(stderr, "  Suffixes (%zu): ", scount);
+		{
+			int first = 1;
+			for (size_t i = 0; i < g_patterns_count; ++i) {
+				if (g_patterns[i].suffix_len > 0 && g_patterns[i].suffix) {
+					if (!first) fprintf(stderr, ", ");
+					fwrite(g_patterns[i].suffix, 1, g_patterns[i].suffix_len, stderr);
+					first = 0;
+				}
+			}
+			fprintf(stderr, "\n");
+		}
+		fflush(stderr);
 	}
 
 	threads = (pthread_t *)malloc(sizeof(pthread_t) * (size_t)g_num_threads);
