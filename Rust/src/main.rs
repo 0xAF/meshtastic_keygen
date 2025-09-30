@@ -19,6 +19,7 @@ struct Config {
     suffix: String, // search + '='
     count: u64,
     quiet: bool,
+    affinity: bool,
 }
 
 fn is_base64_search(s: &str) -> bool {
@@ -42,6 +43,7 @@ fn parse_args() -> Result<Config, String> {
     let mut search: Option<String> = None;
     let mut count: u64 = 1;
     let mut quiet: bool = false;
+    let mut affinity: bool = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -63,6 +65,9 @@ fn parse_args() -> Result<Config, String> {
             "-q" | "--quiet" => {
                 quiet = true;
             }
+            "--affinity" => {
+                affinity = true;
+            }
             "-h" | "--help" => {
                 print_usage(&args[0]);
                 std::process::exit(0);
@@ -76,12 +81,12 @@ fn parse_args() -> Result<Config, String> {
     if !is_base64_search(&search) { return Err("search must contain only Base64 chars [A-Za-z0-9+/]".into()); }
     let suffix = format!("{}=", search);
 
-    Ok(Config { threads, search, suffix, count, quiet })
+    Ok(Config { threads, search, suffix, count, quiet, affinity })
 }
 
 fn print_usage(prog: &str) {
     eprintln!(
-        "Usage: {} -s STR [-t N] [-c C] [-q]\n  -s, --search  STR: Base64 chars only [A-Za-z0-9+/] (no '=')\n  -t, --threads N  : worker threads (default {})\n  -c, --count   C  : stop after C matches (default 1)\n  -q, --quiet      : disable periodic reporting",
+        "Usage: {} -s STR [-t N] [-c C] [-q] [--affinity]\n  -s, --search  STR: Base64 chars only [A-Za-z0-9+/] (no '=')\n  -t, --threads N  : worker threads (default {})\n  -c, --count   C  : stop after C matches (default 1)\n  -q, --quiet      : disable periodic reporting\n      --affinity   : pin worker threads to CPU cores",
         prog, DEFAULT_THREADS
     );
 }
@@ -93,12 +98,26 @@ fn clamp_x25519_scalar(sk: &mut [u8; 32]) {
     sk[31] |= 64;
 }
 
-fn worker(cfg: Arc<Config>, stop: Arc<AtomicBool>, total: Arc<AtomicU64>, found: Arc<AtomicU64>) {
+fn worker(cfg: Arc<Config>, stop: Arc<AtomicBool>, total: Arc<AtomicU64>, found: Arc<AtomicU64>, tid: usize) {
     // Pre-allocate buffers
     let mut rng = SmallRng::from_entropy();
     let mut sk = [0u8; 32];
     let mut b64_pub = [0u8; 44];  // public b64
     let mut b64_priv = [0u8; 44]; // private b64 (only used on match)
+    let prefix = cfg.search.as_bytes().to_owned();
+    let suffix = cfg.suffix.as_bytes().to_owned();
+    let suffix_off = if suffix.len() <= 44 { 44 - suffix.len() } else { 0 };
+    let mut local = 0u64;
+
+    // Optional: set thread affinity for better cache locality
+    if cfg.affinity {
+        if let Some(cores) = core_affinity::get_core_ids() {
+            if !cores.is_empty() {
+                let core = cores[tid % cores.len()];
+                let _ = core_affinity::set_for_current(core);
+            }
+        }
+    }
 
     while !stop.load(Ordering::Relaxed) {
     rng.fill_bytes(&mut sk);
@@ -112,13 +131,13 @@ fn worker(cfg: Arc<Config>, stop: Arc<AtomicBool>, total: Arc<AtomicU64>, found:
 
     // Safety: buffer is ASCII; compare as bytes to avoid allocation
     let enc = &b64_pub[..n];
-        let prefix = cfg.search.as_bytes();
-        let suffix = cfg.suffix.as_bytes();
+        if { local += 1; local >= 1024 } {
+            total.fetch_add(local, Ordering::Relaxed);
+            local = 0;
+        }
 
-        total.fetch_add(1, Ordering::Relaxed);
-
-        let matches_prefix = enc.len() >= prefix.len() && &enc[..prefix.len()] == prefix;
-        let matches_suffix = enc.len() >= suffix.len() && &enc[enc.len()-suffix.len()..] == suffix;
+        let matches_prefix = enc.len() >= prefix.len() && &enc[..prefix.len()] == &*prefix;
+        let matches_suffix = enc.len() >= suffix.len() && &enc[suffix_off..] == &*suffix;
         if matches_prefix || matches_suffix {
             // Encode private key only when needed and print both
             let n_priv = STANDARD.encode_slice(&sk, &mut b64_priv).unwrap();
@@ -133,6 +152,8 @@ fn worker(cfg: Arc<Config>, stop: Arc<AtomicBool>, total: Arc<AtomicU64>, found:
             }
         }
     }
+
+    if local > 0 { total.fetch_add(local, Ordering::Relaxed); }
 }
 
 #[inline]
@@ -183,12 +204,12 @@ fn main() {
 
     // Workers
     let mut handles = Vec::with_capacity(cfg.threads);
-    for _ in 0..cfg.threads {
+    for i in 0..cfg.threads {
         let cfg_c = Arc::clone(&cfg);
         let stop_c = Arc::clone(&stop);
         let total_c = Arc::clone(&total);
         let found_c = Arc::clone(&found);
-        handles.push(thread::spawn(move || worker(cfg_c, stop_c, total_c, found_c)));
+        handles.push(thread::spawn(move || worker(cfg_c, stop_c, total_c, found_c, i)));
     }
 
     for h in handles { let _ = h.join(); }

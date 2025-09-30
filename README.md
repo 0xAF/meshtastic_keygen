@@ -37,7 +37,7 @@ There are two implementations:
 
 - On my Intel(R) Core(TM) i7-14700K with 28 cores and running 28 threads:
   - C: 780 K/s
-  - Rust: 410 K/s
+  - Rust: 445 K/s
 
 ## License
 
