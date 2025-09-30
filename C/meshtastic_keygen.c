@@ -14,12 +14,14 @@
 	0. You just DO WHAT THE F*CK YOU WANT TO.
 */
 
-#define _POSIX_C_SOURCE 199309L
+// Enable GNU extensions for CPU affinity and ensure CLOCK_MONOTONIC availability
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
-#include <openssl/buffer.h>
-#include <openssl/bio.h>
+#include <openssl/crypto.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -30,6 +32,8 @@
 #include <ctype.h>
 #include <time.h>
 #include <signal.h>
+#include <sched.h>
+#include <errno.h>
 
 #define DEFAULT_NUM_THREADS 4
 #define BASE64_LEN 44  // 32 bytes base64 encoded
@@ -40,6 +44,9 @@ static char *g_target_prefix = NULL;
 static char *g_target_suffix = NULL; // prefix with '=' appended
 static size_t g_prefix_len = 0;
 static size_t g_suffix_len = 0;
+static size_t g_suffix_off = 0; // BASE64_LEN - g_suffix_len
+static int g_affinity = 0; // pin worker threads to CPUs
+static int g_quiet = 0;    // disable periodic reporting
 
 static _Atomic unsigned long long g_key_count = 0; // total generated/checked keys
 static _Atomic unsigned long long g_found_count = 0; // total matches found
@@ -68,137 +75,97 @@ static void *reporter(void *arg) {
 	(void)arg;
 	unsigned long long last = 0;
 	while (!atomic_load(&g_stop)) {
-		sleep(1);
-		unsigned long long total = atomic_load(&g_key_count);
+		sleep(5);
+		unsigned long long total = atomic_load_explicit(&g_key_count, memory_order_relaxed);
 		unsigned long long delta = total - last;
 		last = total;
 		char total_str[32];
 		char rate_str[32];
 		human_readable_ull(total, total_str, sizeof total_str);
-		human_readable_ull(delta, rate_str, sizeof rate_str);
+		unsigned long long per_sec = delta / 5ULL;
+		human_readable_ull(per_sec, rate_str, sizeof rate_str);
 		printf("Keys: total=%s, %s/s\n", total_str, rate_str);
 		fflush(stdout);
 	}
 	return NULL;
 }
 
-unsigned char *base64_encode(const unsigned char *input, int length) {
-	BIO *bmem, *b64;
-	BUF_MEM *bptr;
-    
-	unsigned char *buff = NULL;
-
-	b64 = BIO_new(BIO_f_base64());
-	if (!b64) return NULL;
-
-	// Avoid newline insertion to keep output length predictable
-	BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-
-	bmem = BIO_new(BIO_s_mem());
-	if (!bmem) { BIO_free(b64); return NULL; }
-
-	b64 = BIO_push(b64, bmem);
-	if (!b64) { BIO_free_all(bmem); return NULL; }
-
-	if (BIO_write(b64, input, length) <= 0) {
-		BIO_free_all(b64);
-		return NULL;
-	}
-	if (BIO_flush(b64) <= 0) {
-		BIO_free_all(b64);
-		return NULL;
-	}
-	BIO_get_mem_ptr(b64, &bptr);
-	if (!bptr || !bptr->data || bptr->length == 0) {
-		BIO_free_all(b64);
-		return NULL;
-	}
-
-	buff = (unsigned char *)malloc(bptr->length + 1);
-	if (!buff) {
-		BIO_free_all(b64);
-		return NULL;
-	}
-	memcpy(buff, bptr->data, bptr->length);
-	buff[bptr->length] = '\0';
-    
-	BIO_free_all(b64);
-	return buff;
+// Fast fixed-size Base64 for 32-byte input. Produces 44 chars + NUL.
+static inline void base64_encode_32(const unsigned char in[32], char out[45]) {
+	int n = EVP_EncodeBlock((unsigned char *)out, in, 32);
+	// EVP_EncodeBlock never fails for valid args; n should be 44
+	if (n < 0) n = 0;
+	out[n] = '\0';
 }
 
 void *generate_keys(void *arg) {
-	EVP_PKEY_CTX *ctx;
+	// Optional: pin thread to a CPU for better cache locality
+	long tid = (long)(intptr_t)arg;
+#ifdef __linux__
+	if (g_affinity) {
+		int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+		if (ncpu > 0) {
+			cpu_set_t set;
+			CPU_ZERO(&set);
+			CPU_SET((unsigned)(tid % ncpu), &set);
+			(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+		}
+	}
+#endif
+
 	unsigned char priv_key[32];
 	unsigned char pub_key[32];
-	char *encoded_pub;
-	char *encoded_priv;
-    
-	ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
-	if (!ctx) return NULL;
-    
-	while (!atomic_load(&g_stop)) {
-		EVP_PKEY *pkey = NULL; // Ensure pkey is NULL for each iteration
+	char b64_pub[BASE64_LEN + 1];  // 44 + 1
+	char b64_priv[BASE64_LEN + 1]; // 44 + 1
+	unsigned long long local_cnt = 0;
 
-		// Generate key directly
-		if (EVP_PKEY_keygen_init(ctx) <= 0) {
-			continue;
+	while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
+		// Generate random private key bytes
+		if (RAND_bytes(priv_key, sizeof priv_key) != 1) {
+			continue; // try next
 		}
-		if (EVP_PKEY_keygen(ctx, &pkey) <= 0) {
-			if (pkey) EVP_PKEY_free(pkey);
-			continue;
-		}
-        
-		// Extract private and public raw keys (32 bytes each)
+
+	// Clamp private key per X25519 spec
+	priv_key[0] &= 248;
+	priv_key[31] &= 127;
+	priv_key[31] |= 64;
+
+	// Derive public key from private using EVP (lighter than full keygen)
+		EVP_PKEY *pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, priv_key, 32);
+		if (!pkey) continue;
 		size_t len = 32;
-		if (EVP_PKEY_get_raw_private_key(pkey, priv_key, &len) <= 0) {
-			EVP_PKEY_free(pkey);
-			pkey = NULL;
-			continue;
-		}
-		len = 32;
 		if (EVP_PKEY_get_raw_public_key(pkey, pub_key, &len) <= 0) {
 			EVP_PKEY_free(pkey);
-			pkey = NULL;
 			continue;
 		}
-        
-		// Base64 encode public key (used for matching)
-		encoded_pub = (char *)base64_encode(pub_key, 32);
-		if (!encoded_pub) {
-			EVP_PKEY_free(pkey);
-			pkey = NULL;
-			continue;
-		}
-		// Count this generated key regardless of match
-		atomic_fetch_add(&g_key_count, 1ULL);
-        
-		// Check if it starts with the prefix or ends with prefix + '='
-		size_t enc_len = strlen(encoded_pub);
-		if ((g_prefix_len > 0 && strncmp(encoded_pub, g_target_prefix, g_prefix_len) == 0) ||
-			(g_suffix_len > 0 && enc_len >= g_suffix_len && strcmp(encoded_pub + enc_len - g_suffix_len, g_target_suffix) == 0)) {
-			// Encode private key only when we have a match
-			encoded_priv = (char *)base64_encode(priv_key, 32);
-			if (!encoded_priv) {
-				free(encoded_pub);
-				EVP_PKEY_free(pkey);
-				pkey = NULL;
-				continue;
-			}
-			printf("FOUND: pub=%s priv=%s\n", encoded_pub, encoded_priv);
-			fflush(stdout);
-			unsigned long long cur = atomic_fetch_add(&g_found_count, 1ULL) + 1ULL;
-			if (cur >= g_found_target) {
-				atomic_store(&g_stop, 1);
-			}
-			free(encoded_priv);
-		}
-        
-		free(encoded_pub);
 		EVP_PKEY_free(pkey);
-		pkey = NULL;
+
+		// Base64 encode public and check match
+		base64_encode_32(pub_key, b64_pub);
+
+		// Count this generated key regardless of match (batch to reduce contention)
+		if (++local_cnt >= 1024) {
+			atomic_fetch_add_explicit(&g_key_count, local_cnt, memory_order_relaxed);
+			local_cnt = 0;
+		}
+
+		if ((g_prefix_len > 0 && memcmp(b64_pub, g_target_prefix, g_prefix_len) == 0) ||
+			(g_suffix_len > 0 && memcmp(b64_pub + g_suffix_off, g_target_suffix, g_suffix_len) == 0)) {
+			// Encode private key only when we have a match
+			base64_encode_32(priv_key, b64_priv);
+			printf("FOUND: pub=%s priv=%s\n", b64_pub, b64_priv);
+			fflush(stdout);
+			unsigned long long cur = atomic_fetch_add_explicit(&g_found_count, 1ULL, memory_order_relaxed) + 1ULL;
+			if (cur >= g_found_target) {
+				atomic_store_explicit(&g_stop, 1, memory_order_relaxed);
+			}
+		}
 	}
-    
-	EVP_PKEY_CTX_free(ctx);
+
+	// Flush any remaining counts
+	if (local_cnt) {
+		atomic_fetch_add_explicit(&g_key_count, local_cnt, memory_order_relaxed);
+	}
 	return NULL;
 }
 
@@ -232,14 +199,17 @@ static int set_search_string(const char *s) {
 	g_target_suffix[g_prefix_len] = '=';
 	g_target_suffix[g_prefix_len + 1] = '\0';
 	g_suffix_len = g_prefix_len + 1;
+	g_suffix_off = (g_suffix_len <= BASE64_LEN) ? (BASE64_LEN - g_suffix_len) : 0;
 	return 0;
 }
 
 static void print_usage(const char *prog) {
-	fprintf(stderr, "Usage: %s [-t N|--threads N] [-s STR|--search STR] [-c N|--count N]\n", prog);
+	fprintf(stderr, "Usage: %s [-t N|--threads N] [-s STR|--search STR] [-c N|--count N] [--affinity] [-q|--quiet]\n", prog);
 	fprintf(stderr, "  -s STR: required. STR must contain only Base64 characters [A-Za-z0-9+/] (no '=').\n");
 	fprintf(stderr, "  -t N  : optional. Number of threads (default %d).\n", DEFAULT_NUM_THREADS);
 	fprintf(stderr, "  -c N  : optional. Stop after finding N matches (default 1).\n");
+	fprintf(stderr, "  -q, --quiet: optional. Disable periodic reporting.\n");
+	fprintf(stderr, "  --affinity: optional. Pin worker threads to CPU cores (Linux).\n");
 }
 
 void *generate_keys(void *arg);
@@ -276,10 +246,12 @@ int main(int argc, char **argv) {
 		{"threads", required_argument, 0, 't'},
 		{"search",  required_argument, 0, 's'},
 		{"count",   required_argument, 0, 'c'},
+		{"affinity", no_argument,       0,  1 },
+		{"quiet",    no_argument,       0, 'q'},
 		{0, 0, 0, 0}
 	};
 	int opt, idx;
-	while ((opt = getopt_long(argc, argv, "t:s:c:", long_opts, &idx)) != -1) {
+	while ((opt = getopt_long(argc, argv, "t:s:c:q", long_opts, &idx)) != -1) {
 		switch (opt) {
 			case 't': {
 				long n = strtol(optarg, NULL, 10);
@@ -308,6 +280,12 @@ int main(int argc, char **argv) {
 				}
 				g_found_target = (unsigned long long)n;
 			} break;
+			case 1: // --affinity
+				g_affinity = 1;
+				break;
+			case 'q':
+				g_quiet = 1;
+				break;
 			default:
 				print_usage(argv[0]);
 				return 1;
@@ -327,24 +305,28 @@ int main(int argc, char **argv) {
 		return 1;
 	}
     
-	// Initialize OpenSSL
-	OpenSSL_add_all_algorithms();
+	// Initialize OpenSSL PRNG (modern OpenSSL auto-inits). Keep for compatibility.
+	OPENSSL_init_crypto(0, NULL);
     
 	printf("Starting key generation with %d threads...\n", g_num_threads);
     
-	// Create reporter thread
-	pthread_create(&rpt, NULL, reporter, NULL);
+	// Create reporter thread unless quiet
+	if (!g_quiet) {
+		pthread_create(&rpt, NULL, reporter, NULL);
+	}
 
 	// Create worker threads
 	for (int i = 0; i < g_num_threads; i++) {
-		pthread_create(&threads[i], NULL, generate_keys, NULL);
+		pthread_create(&threads[i], NULL, generate_keys, (void*)(intptr_t)i);
 	}
     
 	// Wait for threads (they exit on stop)
 	for (int i = 0; i < g_num_threads; i++) {
 		pthread_join(threads[i], NULL);
 	}
-	pthread_join(rpt, NULL);
+	if (!g_quiet) {
+		pthread_join(rpt, NULL);
+	}
 	free(threads);
 	// Free search strings (unreachable in normal run)
 	free(g_target_prefix);
@@ -355,8 +337,8 @@ int main(int argc, char **argv) {
 	clock_gettime(CLOCK_MONOTONIC, &ts_end);
 	double secs = (ts_end.tv_sec - ts_start.tv_sec) + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
 	if (secs < 0) secs = 0;
-	unsigned long long total_final = atomic_load(&g_key_count);
-	unsigned long long found_final = atomic_load(&g_found_count);
+	unsigned long long total_final = atomic_load_explicit(&g_key_count, memory_order_relaxed);
+	unsigned long long found_final = atomic_load_explicit(&g_found_count, memory_order_relaxed);
 	unsigned long long rate_ull = (unsigned long long)((total_final / (secs > 1e-9 ? secs : 1e-9)) + 0.5);
 	char total_str[32];
 	char rate_str[32];

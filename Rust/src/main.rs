@@ -18,6 +18,7 @@ struct Config {
     search: String,
     suffix: String, // search + '='
     count: u64,
+    quiet: bool,
 }
 
 fn is_base64_search(s: &str) -> bool {
@@ -40,6 +41,7 @@ fn parse_args() -> Result<Config, String> {
     let mut threads = DEFAULT_THREADS;
     let mut search: Option<String> = None;
     let mut count: u64 = 1;
+    let mut quiet: bool = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -58,6 +60,9 @@ fn parse_args() -> Result<Config, String> {
                 count = u64::from_str(&args[i]).map_err(|_| "invalid count value".to_string())?;
                 if count == 0 { return Err("count must be > 0".into()); }
             }
+            "-q" | "--quiet" => {
+                quiet = true;
+            }
             "-h" | "--help" => {
                 print_usage(&args[0]);
                 std::process::exit(0);
@@ -71,12 +76,12 @@ fn parse_args() -> Result<Config, String> {
     if !is_base64_search(&search) { return Err("search must contain only Base64 chars [A-Za-z0-9+/]".into()); }
     let suffix = format!("{}=", search);
 
-    Ok(Config { threads, search, suffix, count })
+    Ok(Config { threads, search, suffix, count, quiet })
 }
 
 fn print_usage(prog: &str) {
     eprintln!(
-        "Usage: {} -s STR [-t N] [-c C]\n  -s, --search  STR: Base64 chars only [A-Za-z0-9+/] (no '=')\n  -t, --threads N  : worker threads (default {})\n  -c, --count   C  : stop after C matches (default 1)",
+        "Usage: {} -s STR [-t N] [-c C] [-q]\n  -s, --search  STR: Base64 chars only [A-Za-z0-9+/] (no '=')\n  -t, --threads N  : worker threads (default {})\n  -c, --count   C  : stop after C matches (default 1)\n  -q, --quiet      : disable periodic reporting",
         prog, DEFAULT_THREADS
     );
 }
@@ -160,19 +165,21 @@ fn main() {
         }).expect("failed to set Ctrl-C handler");
     }
 
-    // Reporter thread
-    let stop_r = Arc::clone(&stop);
-    let total_r = Arc::clone(&total);
-    let reporter = thread::spawn(move || {
-        let mut last = 0u64;
-        while !stop_r.load(Ordering::Relaxed) {
-            thread::sleep(std::time::Duration::from_secs(1));
-            let t = total_r.load(Ordering::Relaxed);
-            let d = t - last; last = t;
-            // println!("Keys: total={}, {}/s", human(t), human(d));
-            safe_println(&format!("Keys: total={}, {}/s", human(t), human(d)));
-        }
-    });
+    // Reporter thread (5s interval, per-second rate)
+    let reporter = if !cfg.quiet {
+        let stop_r = Arc::clone(&stop);
+        let total_r = Arc::clone(&total);
+        Some(thread::spawn(move || {
+            let mut last = 0u64;
+            while !stop_r.load(Ordering::Relaxed) {
+                thread::sleep(std::time::Duration::from_secs(5));
+                let t = total_r.load(Ordering::Relaxed);
+                let d = t - last; last = t;
+                let per_sec = d / 5;
+                safe_println(&format!("Keys: total={}, {}/s", human(t), human(per_sec)));
+            }
+        }))
+    } else { None };
 
     // Workers
     let mut handles = Vec::with_capacity(cfg.threads);
@@ -186,7 +193,7 @@ fn main() {
 
     for h in handles { let _ = h.join(); }
     stop.store(true, Ordering::Relaxed);
-    let _ = reporter.join();
+    if let Some(r) = reporter { let _ = r.join(); }
 
     // Final summary
     let elapsed = start_instant.elapsed();

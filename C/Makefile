@@ -1,5 +1,6 @@
 CC=gcc
-CFLAGS=-O3
+# Optimize for local machine and reduce PLT overhead
+CFLAGS=-O3 -march=native -fno-plt -fomit-frame-pointer -pipe
 LDFLAGS=-lssl -lcrypto -lpthread
 TARGET=meshtastic_keygen
 SRC=meshtastic_keygen.c
