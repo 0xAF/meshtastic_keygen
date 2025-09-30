@@ -21,28 +21,7 @@ There are two implementations:
 - C version in `C/` (depends on OpenSSL and pthreads)
 - Rust version in `Rust/` (pure Rust)
 
-Top-level convenience targets build the C version:
-
-```sh
-make            # builds C/meshtastic_keygen
-make debug      # builds C/meshtastic_keygen_debug with -g -O0
-```
-
-Or build directly in subfolders.
-
-### Rust version (Rust/)
-
-A highly optimized Rust implementation is available under `Rust/`.
-
-Build and run (release mode recommended):
-
-```sh
-cd Rust
-cargo build --release
-cargo run --release -- -s 0xAF -t 8 -c 2
-```
-
-Key differences vs C version:
+## Key differences vs C version:
 
 - Uses Rust’s SmallRng and zero-allocation Base64 encoding into a fixed buffer
 - Lock-free atomics for counters, clean shutdown via Ctrl-C
@@ -53,11 +32,11 @@ Key differences vs C version:
 - Periodic stats once per second: `Keys: total=1.23M, 456K/s`
 - Matches: `FOUND: <base64>`
 
-### Output comparison (C vs Rust)
+### Performance comparison (C vs Rust)
 
 - On my Intel(R) Core(TM) i7-14700K with 28 cores and running 28 threads:
-  - C: 770`K`/s
-  - Rust: 53`M`/s
+  - C: 770**K**/s
+  - Rust: 53**M**/s
 
 ## License
 
