@@ -1,6 +1,6 @@
 # Meshtastic Key Generator
 
-A multi-threaded X25519 private key generator/search tool targeting Base64 prefixes/suffixes. Uses OpenSSL for keygen and Base64 in C, and reports throughput periodically.
+A multi-threaded X25519 private/public keys pair generator/search tool targeting Base64 prefixes/suffixes. Uses OpenSSL for keygen and Base64 in C, and reports throughput periodically.
 
 ## Implementations
 
