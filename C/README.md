@@ -4,19 +4,20 @@ This folder contains the original C implementation.
 
 ## Build
 
-Requires OpenSSL and pthreads.
+Requires OpenSSL and pthreads. Optional: OpenCL for GPU mode.
 
 ```sh
-make            # builds meshtastic_keygen
-make debug      # builds meshtastic_keygen_debug with -g -O0
+make                     # builds meshtastic_keygen (with OpenCL if available)
+make OPENCL=0            # build without OpenCL support
+make debug               # builds meshtastic_keygen_debug with -g -O0
 ```
 
 ## Usage
 
 ```sh
-./meshtastic_keygen --search STR [--search STR]... [--threads N] [--count C] [--affinity] [--quiet] [--better]
+./meshtastic_keygen --search STR [--search STR]... [--threads N] [--count C] [--affinity] [--quiet] [--better] [--gpu]
 # or
-./meshtastic_keygen -s STR [-s STR]... [-t N] [-c C] [-q] [-b]
+./meshtastic_keygen -s STR [-s STR]... [-t N] [-c C] [-q] [-b] [-g]
 ```
 
 - Options:
@@ -26,6 +27,7 @@ make debug      # builds meshtastic_keygen_debug with -g -O0
   - `--quiet`, `-q`: Disable periodic reporting (5s stats)
   - `--affinity`: Pin worker threads to CPU cores (Linux)
   - `--better`, `-b`: Only search for "visually better" adjacent variants around your pattern (the base `STR` and `STR=` are skipped):  
+  - `--gpu`, `-g`: Use the experimental OpenCL GPU implementation (requires OpenCL runtime and `opencl_keygen.cl`). Currently a scaffold; the kernel returns placeholder results until the X25519 ladder is implemented.
     This keeps the requested `STR` but nudges it with Base64 boundary characters for nicer-looking keys.
     - Prefix variants: `STR/` and `STR+`
     - Suffix variants: `/STR=` and `+STR=`
