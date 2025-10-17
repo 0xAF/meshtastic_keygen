@@ -20,13 +20,13 @@ endif
 SRCS=meshtastic_keygen.c $(OCL_SRCS)
 OBJS=$(SRCS:.c=.o)
 
-all: meshtastic_keygen
+all: clean meshtastic_keygen
 
 meshtastic_keygen: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 debug: CFLAGS+=-g -O0
-debug: meshtastic_keygen_debug
+debug: clean meshtastic_keygen_debug
 
 meshtastic_keygen_debug: $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)

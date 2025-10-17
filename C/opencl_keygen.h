@@ -57,3 +57,23 @@ int ocl_debug_final(const char *kernel_path,
 int ocl_trace_ladder(const char *kernel_path,
                      const unsigned char sk[32], unsigned iters,
                      int *out_limbs);
+
+// Autotune: probe safe and fast OpenCL dispatch parameters under a max runtime budget (ms)
+// Returns 0 on success and writes suggested global/local/iters. Conservative sweep to avoid long kernels.
+int ocl_autotune_params(const char *kernel_path,
+                        size_t *out_global, size_t *out_local, unsigned int *out_iters,
+                        unsigned long long seed,
+                        unsigned int max_runtime_ms);
+
+// Async chunk API for double-buffering/pipelining
+struct ocl_async;
+// Enqueue a single chunk asynchronously; returns 0 on success and sets handle.
+int ocl_run_chunk_async(const struct ocl_inputs *in,
+                        size_t global_size,
+                        unsigned int iters_per_wi,
+                        unsigned long long seed,
+                        struct ocl_async **handle);
+// Wait for completion and collect outputs; returns 0 on success.
+int ocl_async_collect(struct ocl_async *handle, struct ocl_outputs *out);
+// Release resources associated with the handle (safe to call after collect or on error).
+void ocl_async_release(struct ocl_async *handle);

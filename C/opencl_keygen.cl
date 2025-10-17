@@ -58,11 +58,18 @@ inline void philox_fill_32bytes(ulong seed64, uint gid, __private uchar out32[32
 }
 
 // ---- Field arithmetic for Curve25519 (mod p = 2^255 - 19) using 10x26-bit limbs ----
-// Adapted from public-domain ref10 style; uses 32-bit limbs with 64-bit temps
+// Two implementations are available:
+//  - MEKG_FE_MUL_IMPL=26 (default): 10x(26/25) schoolbook multiply with 64-bit temps (ref10-style)
+//  - MEKG_FE_MUL_IMPL=51: 5x51 with 128-bit emulation (slower on many GPUs)
+
+#ifndef MEKG_FE_MUL_IMPL
+#define MEKG_FE_MUL_IMPL 26
+#endif
 
 typedef struct { int v[10]; } fe;
 
-// 128-bit signed emulation helpers for OpenCL C (file scope)
+// 128-bit signed emulation helpers for OpenCL C (file scope) - used by impl 51
+#if MEKG_FE_MUL_IMPL == 51
 typedef struct { ulong lo; long hi; } i128_t; // two's complement: value = (hi << 64) | lo
 inline i128_t i128_zero(void) { i128_t r; r.lo=0UL; r.hi=0L; return r; }
 inline void i128_add_pair(i128_t *a, ulong lo, long hi){
@@ -89,6 +96,7 @@ inline void i128_add_smul_ll(i128_t *acc, long x, long y){ i128_t p = i128_mul_l
 // Return lower 64 bits of arithmetic right-shift by 51
 inline ulong i128_shr51_lo64(const i128_t *a){ return (a->lo >> 51) | ((ulong)a->hi << (64 - 51)); }
 inline void i128_mask51(i128_t *a){ a->lo &= ((ulong)1UL<<51) - 1UL; a->hi = 0L; }
+#endif
 
 inline void fe_reduce_canonical_cl(fe *r){
     long long h0=r->v[0], h1=r->v[1], h2=r->v[2], h3=r->v[3], h4=r->v[4];
@@ -121,6 +129,12 @@ inline void fe_reduce_canonical_cl(fe *r){
     r->v[5]=(int)h5; r->v[6]=(int)h6; r->v[7]=(int)h7; r->v[8]=(int)h8; r->v[9]=(int)h9;
 }
 
+// (kept for reference; not used in fast path)
+inline long long shr_floor_ll(long long x, int k) {
+    if (x >= 0) return x >> k;
+    long long n = -x; long long q = (n + ((1LL << k) - 1)) >> k; return -q;
+}
+
 inline void fe_0(fe *h) { for (int i = 0; i < 10; ++i) h->v[i] = 0; }
 inline void fe_1(fe *h) { fe_0(h); h->v[0] = 1; }
 inline void fe_copy(fe *h, const fe *f) { for (int i = 0; i < 10; ++i) h->v[i] = f->v[i]; }
@@ -136,14 +150,13 @@ inline void fe_cswap(fe *f, fe *g, int b) {
 }
 
 inline void fe_mul(fe *h, const fe *f, const fe *g) {
-    // 5x51 implementation with signed packing and 128-bit emulation.
-    // Use raw limbs (may be negative) and perform signed multiply accumulation like CPU.
+#if MEKG_FE_MUL_IMPL == 51
+    // 5x51 implementation with signed packing and 128-bit emulation (slower, kept for fallback/validation)
     long f0 = (long)f->v[0], f1 = (long)f->v[1], f2 = (long)f->v[2], f3 = (long)f->v[3], f4 = (long)f->v[4];
     long f5 = (long)f->v[5], f6 = (long)f->v[6], f7 = (long)f->v[7], f8 = (long)f->v[8], f9 = (long)f->v[9];
     long g0 = (long)g->v[0], g1 = (long)g->v[1], g2 = (long)g->v[2], g3 = (long)g->v[3], g4 = (long)g->v[4];
     long g5 = (long)g->v[5], g6 = (long)g->v[6], g7 = (long)g->v[7], g8 = (long)g->v[8], g9 = (long)g->v[9];
 
-    // pack 10x(26/25) into 5x51 using signed arithmetic
     long F0 = f0 + (f1 << 26);
     long F1 = f2 + (f3 << 26);
     long F2 = f4 + (f5 << 26);
@@ -156,26 +169,18 @@ inline void fe_mul(fe *h, const fe *f, const fe *g) {
     long G3 = g6 + (g7 << 26);
     long G4 = g8 + (g9 << 26);
 
-    // pre-multiply by 19 (signed)
     long G1_19 = G1 * 19L;
     long G2_19 = G2 * 19L;
     long G3_19 = G3 * 19L;
     long G4_19 = G4 * 19L;
 
-    i128_t H0 = i128_zero();
-    i128_t H1 = i128_zero();
-    i128_t H2 = i128_zero();
-    i128_t H3 = i128_zero();
-    i128_t H4 = i128_zero();
-
-    // H0..H4 accumulations using signed multiply
+    i128_t H0 = i128_zero(); i128_t H1 = i128_zero(); i128_t H2 = i128_zero(); i128_t H3 = i128_zero(); i128_t H4 = i128_zero();
     i128_add_smul_ll(&H0, F0, G0);  i128_add_smul_ll(&H0, F1, G4_19); i128_add_smul_ll(&H0, F2, G3_19); i128_add_smul_ll(&H0, F3, G2_19); i128_add_smul_ll(&H0, F4, G1_19);
     i128_add_smul_ll(&H1, F0, G1);  i128_add_smul_ll(&H1, F1, G0);    i128_add_smul_ll(&H1, F2, G4_19); i128_add_smul_ll(&H1, F3, G3_19); i128_add_smul_ll(&H1, F4, G2_19);
     i128_add_smul_ll(&H2, F0, G2);  i128_add_smul_ll(&H2, F1, G1);    i128_add_smul_ll(&H2, F2, G0);    i128_add_smul_ll(&H2, F3, G4_19); i128_add_smul_ll(&H2, F4, G3_19);
     i128_add_smul_ll(&H3, F0, G3);  i128_add_smul_ll(&H3, F1, G2);    i128_add_smul_ll(&H3, F2, G1);    i128_add_smul_ll(&H3, F3, G0);    i128_add_smul_ll(&H3, F4, G4_19);
     i128_add_smul_ll(&H4, F0, G4);  i128_add_smul_ll(&H4, F1, G3);    i128_add_smul_ll(&H4, F2, G2);    i128_add_smul_ll(&H4, F3, G1);    i128_add_smul_ll(&H4, F4, G0);
 
-    // carry reduce to < 2^51, fold top carry via *19
     long c0 = (long)i128_shr51_lo64(&H0); i128_mask51(&H0); i128_add_s64(&H1, c0);
     long c1 = (long)i128_shr51_lo64(&H1); i128_mask51(&H1); i128_add_s64(&H2, c1);
     long c2 = (long)i128_shr51_lo64(&H2); i128_mask51(&H2); i128_add_s64(&H3, c2);
@@ -183,26 +188,51 @@ inline void fe_mul(fe *h, const fe *f, const fe *g) {
     long c4 = (long)i128_shr51_lo64(&H4); i128_mask51(&H4); i128_add_smul_ll(&H0, c4, 19L);
     c0 = (long)i128_shr51_lo64(&H0); i128_mask51(&H0); i128_add_s64(&H1, c0);
 
-    // split back to 10x(26/25)
-    ulong T0 = H0.lo;
-    ulong T1 = H1.lo;
-    ulong T2 = H2.lo;
-    ulong T3 = H3.lo;
-    ulong T4 = H4.lo;
+    ulong T0 = H0.lo; ulong T1 = H1.lo; ulong T2 = H2.lo; ulong T3 = H3.lo; ulong T4 = H4.lo;
+    int h0_i = (int)(T0 & 0x3ffffffUL); int h1_i = (int)(T0 >> 26);
+    int h2_i = (int)(T1 & 0x3ffffffUL); int h3_i = (int)(T1 >> 26);
+    int h4_i = (int)(T2 & 0x3ffffffUL); int h5_i = (int)(T2 >> 26);
+    int h6_i = (int)(T3 & 0x3ffffffUL); int h7_i = (int)(T3 >> 26);
+    int h8_i = (int)(T4 & 0x3ffffffUL); int h9_i = (int)(T4 >> 26);
+    h->v[0]=h0_i; h->v[1]=h1_i; h->v[2]=h2_i; h->v[3]=h3_i; h->v[4]=h4_i; h->v[5]=h5_i; h->v[6]=h6_i; h->v[7]=h7_i; h->v[8]=h8_i; h->v[9]=h9_i;
+#else
+    // 10x(26/25) ref10-style with precomputed 19-folds and doubles
+    long long f0=f->v[0], f1=f->v[1], f2=f->v[2], f3=f->v[3], f4=f->v[4];
+    long long f5=f->v[5], f6=f->v[6], f7=f->v[7], f8=f->v[8], f9=f->v[9];
+    long long g0=g->v[0], g1=g->v[1], g2=g->v[2], g3=g->v[3], g4=g->v[4];
+    long long g5=g->v[5], g6=g->v[6], g7=g->v[7], g8=g->v[8], g9=g->v[9];
 
-    int h0_i = (int)(T0 & 0x3ffffffUL);
-    int h1_i = (int)(T0 >> 26);
-    int h2_i = (int)(T1 & 0x3ffffffUL);
-    int h3_i = (int)(T1 >> 26);
-    int h4_i = (int)(T2 & 0x3ffffffUL);
-    int h5_i = (int)(T2 >> 26);
-    int h6_i = (int)(T3 & 0x3ffffffUL);
-    int h7_i = (int)(T3 >> 26);
-    int h8_i = (int)(T4 & 0x3ffffffUL);
-    int h9_i = (int)(T4 >> 26);
+    long long g1_19 = 19LL*g1, g2_19 = 19LL*g2, g3_19 = 19LL*g3, g4_19 = 19LL*g4, g5_19 = 19LL*g5, g6_19 = 19LL*g6, g7_19 = 19LL*g7, g8_19 = 19LL*g8, g9_19 = 19LL*g9;
+    long long f1_2 = 2LL*f1, f3_2 = 2LL*f3, f5_2 = 2LL*f5, f7_2 = 2LL*f7, f9_2 = 2LL*f9;
 
-    h->v[0]=h0_i; h->v[1]=h1_i; h->v[2]=h2_i; h->v[3]=h3_i; h->v[4]=h4_i;
-    h->v[5]=h5_i; h->v[6]=h6_i; h->v[7]=h7_i; h->v[8]=h8_i; h->v[9]=h9_i;
+    long long h0 = f0*g0 + f1_2*g9_19 + f2*g8_19 + f3_2*g7_19 + f4*g6_19 + f5_2*g5_19 + f6*g4_19 + f7_2*g3_19 + f8*g2_19 + f9_2*g1_19;
+    long long h1 = f0*g1 + f1*g0 + f2*g9_19 + f3*g8_19 + f4*g7_19 + f5*g6_19 + f6*g5_19 + f7*g4_19 + f8*g3_19 + f9*g2_19;
+    long long h2 = f0*g2 + f1_2*g1 + f2*g0 + f3_2*g9_19 + f4*g8_19 + f5_2*g7_19 + f6*g6_19 + f7_2*g5_19 + f8*g4_19 + f9_2*g3_19;
+    long long h3 = f0*g3 + f1*g2 + f2*g1 + f3*g0 + f4*g9_19 + f5*g8_19 + f6*g7_19 + f7*g6_19 + f8*g5_19 + f9*g4_19;
+    long long h4 = f0*g4 + f1_2*g3 + f2*g2 + f3_2*g1 + f4*g0 + f5_2*g9_19 + f6*g8_19 + f7_2*g7_19 + f8*g6_19 + f9_2*g5_19;
+    long long h5 = f0*g5 + f1*g4 + f2*g3 + f3*g2 + f4*g1 + f5*g0 + f6*g9_19 + f7*g8_19 + f8*g7_19 + f9*g6_19;
+    long long h6 = f0*g6 + f1_2*g5 + f2*g4 + f3_2*g3 + f4*g2 + f5_2*g1 + f6*g0 + f7_2*g9_19 + f8*g8_19 + f9_2*g7_19;
+    long long h7 = f0*g7 + f1*g6 + f2*g5 + f3*g4 + f4*g3 + f5*g2 + f6*g1 + f7*g0 + f8*g9_19 + f9*g8_19;
+    long long h8 = f0*g8 + f1_2*g7 + f2*g6 + f3_2*g5 + f4*g4 + f5_2*g3 + f6*g2 + f7_2*g1 + f8*g0 + f9_2*g9_19;
+    long long h9 = f0*g9 + f1*g8 + f2*g7 + f3*g6 + f4*g5 + f5*g4 + f6*g3 + f7*g2 + f8*g1 + f9*g0;
+
+    // Use sign-safe floor shifts for carries to match ref10 semantics exactly
+    long long c;
+    c = shr_floor_ll(h0, 26); h1 += c; h0 -= c << 26;
+    c = shr_floor_ll(h1, 25); h2 += c; h1 -= c << 25;
+    c = shr_floor_ll(h2, 26); h3 += c; h2 -= c << 26;
+    c = shr_floor_ll(h3, 25); h4 += c; h3 -= c << 25;
+    c = shr_floor_ll(h4, 26); h5 += c; h4 -= c << 26;
+    c = shr_floor_ll(h5, 25); h6 += c; h5 -= c << 25;
+    c = shr_floor_ll(h6, 26); h7 += c; h6 -= c << 26;
+    c = shr_floor_ll(h7, 25); h8 += c; h7 -= c << 25;
+    c = shr_floor_ll(h8, 26); h9 += c; h8 -= c << 26;
+    c = shr_floor_ll(h9, 25); h9 -= c << 25; h0 += c * 19LL;
+    c = shr_floor_ll(h0, 26); h1 += c; h0 -= c << 26;
+    c = shr_floor_ll(h1, 25); h2 += c; h1 -= c << 25;
+
+    h->v[0]=(int)h0; h->v[1]=(int)h1; h->v[2]=(int)h2; h->v[3]=(int)h3; h->v[4]=(int)h4; h->v[5]=(int)h5; h->v[6]=(int)h6; h->v[7]=(int)h7; h->v[8]=(int)h8; h->v[9]=(int)h9;
+#endif
 }
 
 inline void fe_sq(fe *h, const fe *f) { fe t; fe_mul(&t, f, f); fe_copy(h, &t); }
@@ -706,9 +736,11 @@ __kernel void pubkey_dump_kernel(
 // Direct-scalar kernel: compute public keys from provided clamped secrets
 __kernel void x25519_from_sk_kernel(
     __global const uchar *in_sk,
-    __global uchar *out_pub
+    __global uchar *out_pub,
+    const uint count
 ) {
     const uint gid = get_global_id(0);
+    if (gid >= count) return;
     __private uchar sk[32];
     for (int i=0;i<32;++i) sk[i] = in_sk[gid*32 + i];
     // Clamp per X25519 decodeScalar25519

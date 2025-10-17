@@ -117,6 +117,8 @@ static inline void fe_reduce_canonical(fe *h){
 	h->v[0]=(int)h0; h->v[1]=(int)h1; h->v[2]=(int)h2; h->v[3]=(int)h3; h->v[4]=(int)h4;
 	h->v[5]=(int)h5; h->v[6]=(int)h6; h->v[7]=(int)h7; h->v[8]=(int)h8; h->v[9]=(int)h9;
 }
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 static inline void fem(fe *h,const fe *f,const fe *g){
 	// Native field multiplication using 5x51 representation with ref10-style reduction.
 	// Convert inputs directly (without serialize-time q-reduction) to avoid unintended mod-p wraps.
@@ -179,6 +181,7 @@ static inline void fem(fe *h,const fe *f,const fe *g){
 	h->v[0] = h0_i; h->v[1] = h1_i; h->v[2] = h2_i; h->v[3] = h3_i; h->v[4] = h4_i;
 	h->v[5] = h5_i; h->v[6] = h6_i; h->v[7] = h7_i; h->v[8] = h8_i; h->v[9] = h9_i;
 }
+#pragma GCC diagnostic pop
 
 // In FE test mode, cross-check fem via BN to ensure correctness, then map back to limbs
 // fem_ref declared later after helpers
@@ -428,6 +431,7 @@ static void ladder_get_x2z2(const unsigned char sk[32], fe *out_x2, fe *out_z2){
 
 // Normalize fe to ref10 carry form and build BIGNUM directly from limbs
 #ifdef ME_KEYGEN_OPENCL
+static void fe_to_canonical_limbs(const fe *h, long long t[10]) __attribute__((unused));
 static void fe_to_canonical_limbs(const fe *h, long long t[10]){
 	// Mirror fetobytes' ref10 q-based canonicalization
 	long long h0=h->v[0], h1=h->v[1], h2=h->v[2], h3=h->v[3], h4=h->v[4];
@@ -507,6 +511,7 @@ static inline void philox4x32_10_u32(uint32_t ctr[4], uint32_t key[2]) {
 	for (int i = 0; i < 10; ++i) philox4x32_round_u32(ctr, key);
 }
 
+#ifdef ME_KEYGEN_OPENCL
 static void philox_fill32_for_gid(uint64_t seed, uint32_t gid, unsigned char out32[32]) {
 	// Build key per ocl host seeds generation in ocl_rng_dump
 	uint32_t k0 = (uint32_t)(seed ^ (0x9E3779B97F4A7C15ULL * (uint64_t)(gid + 1)));
@@ -527,6 +532,7 @@ static void philox_fill32_for_gid(uint64_t seed, uint32_t gid, unsigned char out
 		out32[bi++] = (unsigned char)((w >> 24) & 0xFF);
 	}
 }
+#endif
 
 
 static _Atomic unsigned long long g_key_count = 0; // total generated/checked keys
@@ -747,6 +753,13 @@ static void print_usage(const char *prog) {
 	fprintf(stderr, "  --affinity: optional. Pin worker threads to CPU cores (Linux).\n");
 	fprintf(stderr, "  -b, --better: optional. Only match visually tighter variants: prefix STR/ and STR+; suffix /STR= and +STR=. (Base STR/STR= are skipped.)\n");
 	fprintf(stderr, "  -g, --gpu: optional. Use OpenCL GPU implementation (experimental). Requires OpenCL runtime and kernel file opencl_keygen.cl.\n");
+	fprintf(stderr, "  GPU tuning flags (CLI overrides env MEKG_OCL_*):\n");
+	fprintf(stderr, "    --gpu-gsize N     : Global work size (default 16384)\n");
+	fprintf(stderr, "    --gpu-lsize N     : Local work-group size (default 128)\n");
+	fprintf(stderr, "    --gpu-iters N     : Iterations per work-item (default 64, capped at 512)\n");
+	fprintf(stderr, "    --gpu-autotune    : Enable OpenCL autotune to select parameters within a time budget\n");
+	fprintf(stderr, "    --gpu-budget-ms N : Autotune per-dispatch time budget in ms (default 30)\n");
+	fprintf(stderr, "    --gpu-max-keys N  : Cap keys per dispatch (global*iters) to avoid desktop freezes (default 1048576)\n");
 	// Hidden: set MEKG_TEST_RNG=1 to run RNG consistency test instead of keygen
 }
 
@@ -791,9 +804,17 @@ int main(int argc, char **argv) {
 		{"quiet",    no_argument,       0, 'q'},
 		{"better",   no_argument,       0, 'b'},
 		{"gpu",      no_argument,       0, 'g'},
+		{"gpu-gsize", required_argument, 0,  2 },
+		{"gpu-lsize", required_argument, 0,  3 },
+		{"gpu-iters", required_argument, 0,  4 },
+		{"gpu-autotune", no_argument,    0,  5 },
+		{"gpu-budget-ms", required_argument, 0, 6 },
+		{"gpu-max-keys", required_argument, 0, 7 },
 		{0, 0, 0, 0}
 	};
 	int opt, idx;
+	// Capture CLI GPU tuning values
+	size_t cli_gsize = 0, cli_lsize = 0; unsigned int cli_iters = 0; int cli_autotune = -1; unsigned int cli_budget_ms = 0; unsigned long long cli_max_keys = 0ULL;
 	while ((opt = getopt_long(argc, argv, "t:s:c:qbg", long_opts, &idx)) != -1) {
 		switch (opt) {
 			case 't': {
@@ -843,11 +864,47 @@ int main(int argc, char **argv) {
 			case 'g':
 				g_use_gpu = 1;
 				break;
+			case 2: { // --gpu-gsize
+				unsigned long long v = strtoull(optarg, NULL, 10);
+				if (v == 0) { fprintf(stderr, "Invalid --gpu-gsize\n"); return 1; }
+				cli_gsize = (size_t)v;
+				g_use_gpu = 1;
+			} break;
+			case 3: { // --gpu-lsize
+				unsigned long long v = strtoull(optarg, NULL, 10);
+				if (v == 0) { fprintf(stderr, "Invalid --gpu-lsize\n"); return 1; }
+				cli_lsize = (size_t)v;
+				g_use_gpu = 1;
+			} break;
+			case 4: { // --gpu-iters
+				unsigned long v = strtoul(optarg, NULL, 10);
+				if (v == 0) { fprintf(stderr, "Invalid --gpu-iters\n"); return 1; }
+				cli_iters = (unsigned int)v;
+				g_use_gpu = 1;
+			} break;
+			case 5: { // --gpu-autotune
+				cli_autotune = 1; g_use_gpu = 1;
+			} break;
+			case 6: { // --gpu-budget-ms
+				unsigned long v = strtoul(optarg, NULL, 10);
+				if (v == 0) { fprintf(stderr, "Invalid --gpu-budget-ms\n"); return 1; }
+				cli_budget_ms = (unsigned int)v; g_use_gpu = 1;
+			} break;
+			case 7: { // --gpu-max-keys
+				unsigned long long v = strtoull(optarg, NULL, 10);
+				if (v == 0) { fprintf(stderr, "Invalid --gpu-max-keys\n"); return 1; }
+				cli_max_keys = v; g_use_gpu = 1;
+			} break;
 			default:
 				print_usage(argv[0]);
 				return 1;
 		}
 	}
+
+#ifndef ME_KEYGEN_OPENCL
+	// When built without OpenCL, GPU-related CLI values are parsed but unused; mark them used to avoid warnings.
+	(void)cli_gsize; (void)cli_lsize; (void)cli_iters; (void)cli_autotune; (void)cli_budget_ms; (void)cli_max_keys;
+#endif
 
 	// Read hidden test env flags early so we can skip required -s in test modes
 	const char *env_test = getenv("MEKG_TEST_RNG");
@@ -876,41 +933,7 @@ int main(int argc, char **argv) {
 		for (size_t i = 0; i < searches_count; ++i) free(searches[i]);
 		free(searches);
 
-		// Print search patterns (prefixes and suffixes)
-		{
-			// Count and print prefixes
-			size_t pcount = 0, scount = 0;
-			for (size_t i = 0; i < g_patterns_count; ++i) {
-				if (g_patterns[i].prefix_len > 0) pcount++;
-				if (g_patterns[i].suffix_len > 0) scount++;
-			}
-			fprintf(stderr, "Search patterns:\n");
-			fprintf(stderr, "  Prefixes (%zu): ", pcount);
-			{
-				int first = 1;
-				for (size_t i = 0; i < g_patterns_count; ++i) {
-					if (g_patterns[i].prefix_len > 0 && g_patterns[i].prefix) {
-						if (!first) fprintf(stderr, ", ");
-						fwrite(g_patterns[i].prefix, 1, g_patterns[i].prefix_len, stderr);
-						first = 0;
-					}
-				}
-				fprintf(stderr, "\n");
-			}
-			fprintf(stderr, "  Suffixes (%zu): ", scount);
-			{
-				int first = 1;
-				for (size_t i = 0; i < g_patterns_count; ++i) {
-					if (g_patterns[i].suffix_len > 0 && g_patterns[i].suffix) {
-						if (!first) fprintf(stderr, ", ");
-						fwrite(g_patterns[i].suffix, 1, g_patterns[i].suffix_len, stderr);
-						first = 0;
-					}
-				}
-				fprintf(stderr, "\n");
-			}
-			fflush(stderr);
-		}
+		// (duplicate print of search patterns removed)
 	} else {
 		// In test mode, free any collected search strings and skip building patterns
 		for (size_t i = 0; i < searches_count; ++i) free(searches[i]);
@@ -1186,7 +1209,7 @@ int main(int argc, char **argv) {
 			BIGNUM *bbn = BN_from_fe_limbs(&b);
 			if (BN_cmp(abn, Abn) != 0 || BN_cmp(bbn, Bbn) != 0){
 				unsigned char ar[32], br[32]; fetobytes(ar, &a); fetobytes(br, &b);
-				char Ale_b64[45], Ble_b64[45], Ar_b64[45], Br_b64[45], Abn_b64[45], Bbn_b64[45];
+				char Ale_b64[45], Ble_b64[45], Ar_b64[45], Br_b64[45];
 				base64_encode_32(Ale, Ale_b64); base64_encode_32(Ble, Ble_b64);
 				base64_encode_32(ar, Ar_b64); base64_encode_32(br, Br_b64);
 				unsigned char abe_be[32], bbe_be[32]; BN_bn2binpad(abn, abe_be, 32); BN_bn2binpad(bbn, bbe_be, 32);
@@ -1533,7 +1556,7 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "This binary was built without OpenCL support. Rebuild with OPENCL=1.\n");
 		return 2;
 #else
-		// GPU path: prepare inputs and run one or more batches until target met
+		// GPU path: prepare inputs and run batches until target met
 		if (!ocl_is_available()) {
 			fprintf(stderr, "OpenCL runtime not available.\n");
 			return 2;
@@ -1550,28 +1573,157 @@ int main(int argc, char **argv) {
 		}
 		// Try to locate the kernel file relative to current directory
 		const char *kernel_path = "opencl_keygen.cl";
-		struct ocl_inputs in = {
-			.kernel_path = kernel_path,
-			.patterns = pats,
-			.patterns_count = g_patterns_count,
-			.target_count = (unsigned int)g_found_target,
-			.global_size = 8192, .local_size = 256, .iters_per_wi = 512,
-			.seed = (unsigned long long)time(NULL)
-		};
-		struct ocl_outputs out = {0};
-		int rc = ocl_run_batch(&in, &out);
-		if (rc == 0) {
-			for (unsigned int i = 0; i < out.found; ++i) {
-				printf("FOUND: pub=%s priv=%s\n", out.matches[i].pub_b64, out.matches[i].priv_b64);
-				fprintf(stderr, "FOUND: pub=%s priv=%s\n", out.matches[i].pub_b64, out.matches[i].priv_b64);
+	unsigned long long seed = (unsigned long long)time(NULL);
+		// Safer defaults to avoid long-running kernels that can freeze desktop GPUs
+		const char *ev_g = getenv("MEKG_OCL_GSIZE");
+		const char *ev_l = getenv("MEKG_OCL_LSIZE");
+		const char *ev_i = getenv("MEKG_OCL_ITERS");
+	// Defaults tuned from observed stability/throughput: 16384/128/64
+	size_t def_gsize = 16384;
+	size_t def_lsize = 128;
+	unsigned int def_iters = 64;
+		// Precedence: CLI > env > defaults
+		size_t user_gsize = cli_gsize ? cli_gsize : (ev_g ? (size_t)strtoull(ev_g, NULL, 10) : def_gsize);
+		size_t user_lsize = cli_lsize ? cli_lsize : (ev_l ? (size_t)strtoull(ev_l, NULL, 10) : def_lsize);
+		unsigned int user_iters = cli_iters ? cli_iters : (ev_i ? (unsigned int)strtoul(ev_i, NULL, 10) : def_iters);
+		// Optional autotune: MEKG_OCL_AUTOTUNE=1 enables probing for safe fast params under a time budget (ms)
+		const char *ev_aut = getenv("MEKG_OCL_AUTOTUNE");
+		const char *ev_aut_ms = getenv("MEKG_OCL_AUTOTUNE_MS");
+		int do_autotune = (cli_autotune == 1) || (ev_aut && (*ev_aut=='1' || *ev_aut=='y' || *ev_aut=='Y' || *ev_aut=='t' || *ev_aut=='T'));
+		if (do_autotune) {
+			unsigned int budget_ms = cli_budget_ms ? cli_budget_ms : (ev_aut_ms ? (unsigned int)strtoul(ev_aut_ms, NULL, 10) : 30U);
+			size_t tg=user_gsize, tl=user_lsize; unsigned int ti=user_iters;
+			int arc = ocl_autotune_params(kernel_path, &tg, &tl, &ti, seed, budget_ms);
+			if (arc == 0) {
+				// Accept tuned params (and keep hard cap on iters)
+				user_gsize = tg; user_lsize = tl; user_iters = ti;
+				if (user_iters > 512u) user_iters = 512u;
+				fprintf(stderr, "OpenCL autotune: selected global=%zu local=%zu iters=%u (budget=%ums)\n", user_gsize, user_lsize, user_iters, budget_ms);
+			} else {
+				fprintf(stderr, "OpenCL autotune failed, using defaults or env overrides.\n");
 			}
-			// For now we do a single batch. Future: loop until reaching g_found_target.
-		} else {
-			fprintf(stderr, "GPU batch failed.\n");
-			free(pats);
-			return 3;
 		}
-		free(out.matches);
+		if (user_gsize == 0) user_gsize = def_gsize;
+		if (user_lsize == 0) user_lsize = def_lsize;
+		if (user_iters == 0) user_iters = def_iters;
+		// Gentle caps
+		if (user_iters > 512u) user_iters = 512u;
+		// Determine per-dispatch cap (keys = global*iters)
+		const char *ev_maxk = getenv("MEKG_OCL_MAX_KEYS");
+		unsigned long long max_keys = cli_max_keys ? cli_max_keys : (ev_maxk ? strtoull(ev_maxk, NULL, 10) : 1048576ULL);
+		if (max_keys == 0ULL) max_keys = 1048576ULL;
+		fprintf(stderr, "OpenCL batch params: global=%zu local=%zu iters=%u (set MEKG_OCL_GSIZE/LSIZE/ITERS to override)\n",
+			user_gsize, user_lsize, user_iters);
+		fprintf(stderr, "OpenCL dispatch cap: max_keys=%llu (override with --gpu-max-keys or MEKG_OCL_MAX_KEYS)\n", (unsigned long long)max_keys);
+	// Start periodic reporter like CPU path
+	int gpu_reporter_started = 0;
+	if (!g_quiet) { pthread_create(&rpt, NULL, reporter, NULL); gpu_reporter_started = 1; }
+
+	unsigned long long total_found = 0;
+		while (!atomic_load_explicit(&g_stop, memory_order_relaxed) && total_found < g_found_target) {
+			struct ocl_inputs in = {
+				.kernel_path = kernel_path,
+				.patterns = pats,
+				.patterns_count = g_patterns_count,
+				.target_count = (unsigned int)(g_found_target - total_found),
+				.global_size = user_gsize, .local_size = user_lsize, .iters_per_wi = user_iters,
+				.seed = seed
+			};
+			// Host-level chunking: split large global into safe sub-dispatches respecting max_keys
+			size_t left = user_gsize;
+			// Account for OpenCL padding to local size: at minimum, kernel runs 'local_size' work-items.
+			// Ensure (local_size * iters) <= max_keys to truly respect the cap.
+			unsigned long long max_iters_by_cap = (user_lsize > 0) ? (max_keys / (unsigned long long)user_lsize) : max_keys;
+			if (max_iters_by_cap == 0ULL) max_iters_by_cap = 1ULL; // always allow at least 1 iteration
+			unsigned int effective_iters = user_iters;
+			if ((unsigned long long)effective_iters > max_iters_by_cap) {
+				unsigned long long new_iters = max_iters_by_cap;
+				if (new_iters > 512ULL) new_iters = 512ULL;
+				effective_iters = (unsigned int)(new_iters > 0ULL ? new_iters : 1ULL);
+				fprintf(stderr, "Note: reducing iters to %u so (local*iters) <= max_keys\n", effective_iters);
+			}
+			// Double-buffered pipeline: keep up to two in-flight chunks (async compute + copy)
+			struct ocl_async *inflight[2] = { NULL, NULL };
+			size_t inflight_idx = 0;
+			while (left > 0 && !atomic_load_explicit(&g_stop, memory_order_relaxed)) {
+				unsigned long long max_wi_by_keys = max_keys / (unsigned long long)effective_iters;
+				if (max_wi_by_keys == 0ULL) max_wi_by_keys = (unsigned long long)user_lsize; // due to padding, we'll run at least local size
+				size_t lim_by_keys = (size_t)((max_wi_by_keys / (unsigned long long)user_lsize) * (unsigned long long)user_lsize);
+				if (lim_by_keys == 0) lim_by_keys = user_lsize;
+				size_t chunk = left < lim_by_keys ? left : lim_by_keys;
+				if (chunk < user_lsize) chunk = user_lsize;
+				chunk = (chunk / user_lsize) * user_lsize;
+				if (chunk == 0) chunk = user_lsize;
+
+				// Launch next chunk asynchronously
+				struct ocl_async *h = NULL;
+				int arc = ocl_run_chunk_async(&in, chunk, effective_iters, seed, &h);
+				if (arc != 0) {
+					fprintf(stderr, "GPU async chunk failed.\n");
+					if (gpu_reporter_started) { atomic_store_explicit(&g_stop, 1, memory_order_relaxed); pthread_join(rpt, NULL); }
+					free(pats);
+					return 3;
+				}
+				// Account keys for this launched chunk
+				unsigned long long keys_this_chunk = (unsigned long long)chunk * (unsigned long long)effective_iters;
+				atomic_fetch_add_explicit(&g_key_count, keys_this_chunk, memory_order_relaxed);
+
+				// If we already have a previous inflight, collect it now to overlap compute of 'h' with readback of previous
+				struct ocl_async *prev = inflight[inflight_idx];
+				inflight[inflight_idx] = h;
+				inflight_idx ^= 1; // toggle slot
+
+				if (prev) {
+					struct ocl_outputs pout = {0};
+					if (ocl_async_collect(prev, &pout) != 0) {
+						fprintf(stderr, "GPU async collect failed.\n");
+						ocl_async_release(prev);
+						if (gpu_reporter_started) { atomic_store_explicit(&g_stop, 1, memory_order_relaxed); pthread_join(rpt, NULL); }
+						free(pats);
+						return 3;
+					}
+					for (unsigned int i = 0; i < pout.found; ++i) {
+						printf("FOUND: pub=%s priv=%s\n", pout.matches[i].pub_b64, pout.matches[i].priv_b64);
+						fprintf(stderr, "FOUND: pub=%s priv=%s\n", pout.matches[i].pub_b64, pout.matches[i].priv_b64);
+					}
+					if (pout.found > 0) {
+						atomic_fetch_add_explicit(&g_found_count, pout.found, memory_order_relaxed);
+						total_found += pout.found;
+					}
+					free(pout.matches);
+					ocl_async_release(prev);
+				}
+
+				// Advance
+				size_t dec = (left < chunk) ? left : chunk; left -= dec;
+				seed += 0x9E3779B97F4A7C15ULL;
+			}
+			// Collect any remaining inflight chunks
+			for (int k = 0; k < 2; ++k) {
+				if (inflight[k]) {
+					struct ocl_outputs pout = {0};
+					if (ocl_async_collect(inflight[k], &pout) != 0) {
+						fprintf(stderr, "GPU async collect failed.\n");
+						ocl_async_release(inflight[k]); inflight[k] = NULL;
+						if (gpu_reporter_started) { atomic_store_explicit(&g_stop, 1, memory_order_relaxed); pthread_join(rpt, NULL); }
+						free(pats);
+						return 3;
+					}
+					for (unsigned int i = 0; i < pout.found; ++i) {
+						printf("FOUND: pub=%s priv=%s\n", pout.matches[i].pub_b64, pout.matches[i].priv_b64);
+						fprintf(stderr, "FOUND: pub=%s priv=%s\n", pout.matches[i].pub_b64, pout.matches[i].priv_b64);
+					}
+					if (pout.found > 0) {
+						atomic_fetch_add_explicit(&g_found_count, pout.found, memory_order_relaxed);
+						total_found += pout.found;
+					}
+					free(pout.matches);
+					ocl_async_release(inflight[k]); inflight[k] = NULL;
+				}
+			}
+		}
+	atomic_store_explicit(&g_stop, 1, memory_order_relaxed);
+	if (gpu_reporter_started) { pthread_join(rpt, NULL); }
 		free(pats);
 #endif
 	}
