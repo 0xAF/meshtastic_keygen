@@ -35,6 +35,10 @@
 #include <sched.h>
 #include <errno.h>
 #include <stdint.h>
+#include <dlfcn.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
 
 #ifdef ME_KEYGEN_OPENCL
 #include "opencl_keygen.h"
@@ -65,6 +69,45 @@ static int g_test_pub = 0; // internal: run pubkey consistency test (CPU vs GPU)
 static int g_test_rfc = 0; // internal: validate RFC 7748 X25519 basepoint vectors
 static int g_test_trace = 0; // internal: dump CPU vs GPU ladder state for RFC Alice
 static int g_test_fe = 0;    // internal: validate field ops via big-int reference
+// Try to use X25519_public_from_private via dynamic lookup if available in libcrypto
+static int x25519_pub_from_priv_dyn(unsigned char out[32], const unsigned char priv[32]) {
+	typedef void (*x25519_pub_from_priv_fn)(unsigned char out[32], const unsigned char private_key[32]);
+	static x25519_pub_from_priv_fn fn = NULL;
+	static int resolved = 0;
+	if (!resolved) {
+		resolved = 1;
+		// Since we link with -lcrypto, RTLD_DEFAULT search should find it if present
+		void *sym = dlsym(RTLD_DEFAULT, "X25519_public_from_private");
+		if (sym) fn = (x25519_pub_from_priv_fn)sym;
+	}
+	if (fn) { fn(out, priv); return 1; }
+	return 0;
+}
+
+// ---- CPU feature detection (x86/x64) ----
+static int g_has_bmi2 = 0;
+static int g_has_adx = 0;
+static int g_has_avx2 = 0;
+static int g_has_avx512ifma = 0;
+
+static void cpu_detect_features(void) {
+#if defined(__x86_64__) || defined(__i386__)
+	unsigned int eax=0, ebx=0, ecx=0, edx=0;
+	unsigned int max_leaf = __get_cpuid_max(0, NULL);
+	if (max_leaf >= 7) {
+		// Leaf 7, subleaf 0
+		__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx);
+		// Bits from CPUID.(EAX=07H, ECX=0):EBX
+		// AVX2 = bit 5, BMI2 = bit 8, ADX = bit 19, AVX-512 IFMA = bit 21 (if supported)
+		g_has_avx2 = (ebx >> 5) & 1U;
+		g_has_bmi2 = (ebx >> 8) & 1U;
+		g_has_adx  = (ebx >> 19) & 1U;
+		g_has_avx512ifma = (ebx >> 21) & 1U; // presence only; OS XSAVE checks omitted for now
+	}
+#else
+	// Non-x86: leave all zeros
+#endif
+}
 
 #ifdef ME_KEYGEN_OPENCL
 // --- Minimal CPU ref10-style field ops for ladder tracing ---
@@ -119,7 +162,8 @@ static inline void fe_reduce_canonical(fe *h){
 }
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
-static inline void fem(fe *h,const fe *f,const fe *g){
+// Baseline 5x51 multiply (kept as a concrete implementation)
+static inline void fem_baseline(fe *h,const fe *f,const fe *g){
 	// Native field multiplication using 5x51 representation with ref10-style reduction.
 	// Convert inputs directly (without serialize-time q-reduction) to avoid unintended mod-p wraps.
 	long long f0 = f->v[0], f1 = f->v[1], f2 = f->v[2], f3 = f->v[3], f4 = f->v[4];
@@ -183,9 +227,17 @@ static inline void fem(fe *h,const fe *f,const fe *g){
 }
 #pragma GCC diagnostic pop
 
+// Function-pointer based FE backend (scaffolding for future ADX/BMI2/AVX*)
+typedef void (*fe_mul_fn)(fe *h, const fe *f, const fe *g);
+typedef void (*fe_sq_fn)(fe *h, const fe *f);
+static void fesq_baseline(fe *h, const fe *f) { fem_baseline(h, f, f); }
+static fe_mul_fn g_fe_mul = fem_baseline;
+static fe_sq_fn  g_fe_sq  = fesq_baseline;
+static inline void fem(fe *h, const fe *f, const fe *g) { g_fe_mul(h, f, g); }
+static inline void fesq(fe *h, const fe *f) { g_fe_sq(h, f); }
+
 // In FE test mode, cross-check fem via BN to ensure correctness, then map back to limbs
 // fem_ref declared later after helpers
-static inline void fesq(fe *h,const fe *f){ fem(h,f,f); }
 static inline void fea24(fe *h,const fe *f){
 	// Use a24 = (A-2)/4 = 121665 per RFC 7748 with z2 = E*(AA + a24*E)
 	fe a24c; fe0(&a24c); a24c.v[0] = 121665; fem(h, f, &a24c);
@@ -606,26 +658,35 @@ void *generate_keys(void *arg) {
 	char b64_priv[BASE64_LEN + 1]; // 44 + 1
 	unsigned long long local_cnt = 0;
 
+	// Batch RNG to reduce RAND_bytes overhead and locking
+	enum { RAND_KEYS_BATCH = 4096 };
+	unsigned char rand_buf[RAND_KEYS_BATCH * 32];
+	size_t rand_off = RAND_KEYS_BATCH * 32; // force initial refill
+
 	while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
-		// Generate random private key bytes
-		if (RAND_bytes(priv_key, sizeof priv_key) != 1) {
-			continue; // try next
+		// Generate random private key bytes (buffered)
+		if (rand_off >= sizeof(rand_buf)) {
+			if (RAND_bytes(rand_buf, sizeof(rand_buf)) != 1) {
+				continue; // try next
+			}
+			rand_off = 0;
 		}
+		memcpy(priv_key, rand_buf + rand_off, 32);
+		rand_off += 32;
 
 	// Clamp private key per X25519 spec
 	priv_key[0] &= 248;
 	priv_key[31] &= 127;
 	priv_key[31] |= 64;
 
-	// Derive public key from private using EVP (lighter than full keygen)
-		EVP_PKEY *pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, priv_key, 32);
-		if (!pkey) continue;
-		size_t len = 32;
-		if (EVP_PKEY_get_raw_public_key(pkey, pub_key, &len) <= 0) {
+	// Derive public key: try fast X25519_public_from_private if available, else EVP fallback
+		if (!x25519_pub_from_priv_dyn(pub_key, priv_key)) {
+			EVP_PKEY *pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, priv_key, 32);
+			if (!pkey) continue;
+			size_t len = 32;
+			if (EVP_PKEY_get_raw_public_key(pkey, pub_key, &len) <= 0) { EVP_PKEY_free(pkey); continue; }
 			EVP_PKEY_free(pkey);
-			continue;
 		}
-		EVP_PKEY_free(pkey);
 
 		// Base64 encode public and check match
 		base64_encode_32(pub_key, b64_pub);
@@ -781,6 +842,10 @@ int main(int argc, char **argv) {
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
 
+	// Detect CPU features and select FE backend (baseline for now; ADX/BMI2 coming next)
+	cpu_detect_features();
+	// Future: if (g_has_adx && g_has_bmi2) g_fe_mul = fem_adx; g_fe_sq = fesq_adx;
+
 	// Print start wall-clock timestamp
 	{
 		time_t now = time(NULL);
@@ -901,6 +966,11 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	if (!g_quiet) {
+		fprintf(stderr, "CPU features: BMI2=%d ADX=%d AVX2=%d AVX512IFMA=%d\n", g_has_bmi2, g_has_adx, g_has_avx2, g_has_avx512ifma);
+		fflush(stderr);
+	}
+
 #ifndef ME_KEYGEN_OPENCL
 	// When built without OpenCL, GPU-related CLI values are parsed but unused; mark them used to avoid warnings.
 	(void)cli_gsize; (void)cli_lsize; (void)cli_iters; (void)cli_autotune; (void)cli_budget_ms; (void)cli_max_keys;
@@ -917,8 +987,11 @@ int main(int argc, char **argv) {
 	const char *env_fe = getenv("MEKG_TEST_FE");
 	if (env_fe && atoi(env_fe) != 0) g_test_fe = 1;
 	if (env_trace && *env_trace == '1') { g_test_trace = 1; }
+	// Hidden CPU benchmark: MEKG_BENCH_MS=duration_ms runs CPU-only for duration and prints keys/s
+	const char *env_bench_ms = getenv("MEKG_BENCH_MS");
+	unsigned int bench_ms = env_bench_ms ? (unsigned int)strtoul(env_bench_ms, NULL, 10) : 0U;
 	const char *env_one = getenv("MEKG_TEST_ONE_SK_HEX");
-	int any_test_mode = g_test_rng || g_test_pub || g_test_rfc || g_test_trace || g_test_fe || (env_one && *env_one);
+	int any_test_mode = g_test_rng || g_test_pub || g_test_rfc || g_test_trace || g_test_fe || (env_one && *env_one) || (bench_ms > 0);
 
 	// After parsing, create search patterns from collected strings (respects -b), unless in test mode
 	if (!any_test_mode) {
@@ -1536,6 +1609,26 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Built without OpenCL; RFC test unavailable.\n");
 		return 2;
 #endif
+	} else if (bench_ms > 0 && !g_use_gpu) {
+		// CPU-only benchmark mode: run N threads for bench_ms and report keys/s
+		threads = (pthread_t *)malloc(sizeof(pthread_t) * (size_t)g_num_threads);
+		if (!threads) { fprintf(stderr, "Failed to allocate thread handles\n"); return 1; }
+		OPENSSL_init_crypto(0, NULL);
+		if (!g_quiet) fprintf(stderr, "Benchmark: running %u ms on %d threads...\n", bench_ms, g_num_threads);
+		for (int i = 0; i < g_num_threads; i++) { pthread_create(&threads[i], NULL, generate_keys, (void*)(intptr_t)i); }
+		// Sleep for duration then stop
+		struct timespec ts; ts.tv_sec = bench_ms / 1000U; ts.tv_nsec = (long)(bench_ms % 1000U) * 1000000L; nanosleep(&ts, NULL);
+		atomic_store_explicit(&g_stop, 1, memory_order_relaxed);
+		for (int i = 0; i < g_num_threads; i++) { pthread_join(threads[i], NULL); }
+		free(threads);
+		unsigned long long total = atomic_load_explicit(&g_key_count, memory_order_relaxed);
+		double secs = (double)bench_ms / 1000.0;
+		double rate = secs > 0.0 ? (double)total / secs : 0.0;
+		char total_str[32], rate_str[32];
+		human_readable_ull(total, total_str, sizeof total_str);
+		human_readable_ull((unsigned long long)rate, rate_str, sizeof rate_str);
+		fprintf(stderr, "Benchmark done. Elapsed: %.3fs | total keys: %s | rate: %s/s\n", secs, total_str, rate_str);
+		return 0;
 	} else if (!g_use_gpu) {
 		// fall through to normal CPU keygen
 		threads = (pthread_t *)malloc(sizeof(pthread_t) * (size_t)g_num_threads);

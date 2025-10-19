@@ -3,7 +3,7 @@
 CC=gcc
 CFLAGS?=-O3 -Wall -Wextra -Wpedantic -std=c11 -march=native -fno-plt -fomit-frame-pointer -pipe
 LDFLAGS?=
-LIBS=-lcrypto -lpthread
+LIBS=-lcrypto -lpthread -ldl
 
 # Enable OpenCL support by setting OPENCL=1 (default is disabled to avoid requiring headers)
 OPENCL?=0
