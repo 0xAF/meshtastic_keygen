@@ -1,3 +1,6 @@
 meshtastic_keygen
 meshtastic_keygen_debug
 third_party/
+found.txt
+*.o
+
