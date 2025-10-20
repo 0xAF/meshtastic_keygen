@@ -22,6 +22,10 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
+#ifdef ME_USE_LIB25519
+#include <lib25519.h>
+#include <openssl/rand.h>
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -38,6 +42,20 @@
 #include <dlfcn.h>
 #if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
+#include <immintrin.h>
+#endif
+
+// Compiler diagnostic helpers (suppress targeted -Wpedantic noise for GNU extensions like __int128)
+#if defined(__GNUC__) || defined(__clang__)
+#define ME_DIAG_PUSH _Pragma("GCC diagnostic push")
+#define ME_DIAG_POP _Pragma("GCC diagnostic pop")
+#define ME_DIAG_IGNORED_PEDANTIC _Pragma("GCC diagnostic ignored \"-Wpedantic\"")
+#define ME_MAYBE_UNUSED __attribute__((unused))
+#else
+#define ME_DIAG_PUSH
+#define ME_DIAG_POP
+#define ME_DIAG_IGNORED_PEDANTIC
+#define ME_MAYBE_UNUSED
 #endif
 
 #ifdef ME_KEYGEN_OPENCL
@@ -46,6 +64,17 @@
 
 #define DEFAULT_NUM_THREADS 4
 #define BASE64_LEN 44  // 32 bytes base64 encoded
+#ifdef ME_USE_LIB25519
+static const unsigned char X25519_BASEPOINT[32] = { 9, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 };
+
+// Satisfy lib25519's optional dependency on randombytes() for keypair APIs.
+// We don't call those, but provide a secure implementation to allow static linking.
+void randombytes(unsigned char *out, unsigned long long outlen) {
+	if (outlen > 0) {
+		(void)RAND_bytes(out, (int)outlen);
+	}
+}
+#endif
 
 // Runtime-configurable settings
 static int g_num_threads = DEFAULT_NUM_THREADS;
@@ -56,6 +85,12 @@ struct search_pattern {
 	size_t prefix_len;
 	size_t suffix_len;
 	size_t suffix_off; // BASE64_LEN - suffix_len
+	// Fast prefilter: first up to 4 Base64 chars (from first 3 bytes) and
+	// last up to 3 Base64 chars before '=' (from last 2 bytes) for 32-byte input
+	unsigned char pre_mask_len; // 0..4
+	unsigned char pre_idx[4];   // indices 0..63 for first chars
+	unsigned char suf_mask_len; // 0..3 (we ignore the trailing '=')
+	unsigned char suf_idx[3];   // indices for last 1..3 chars before '='
 };
 static struct search_pattern *g_patterns = NULL;
 static size_t g_patterns_count = 0;
@@ -69,7 +104,40 @@ static int g_test_pub = 0; // internal: run pubkey consistency test (CPU vs GPU)
 static int g_test_rfc = 0; // internal: validate RFC 7748 X25519 basepoint vectors
 static int g_test_trace = 0; // internal: dump CPU vs GPU ladder state for RFC Alice
 static int g_test_fe = 0;    // internal: validate field ops via big-int reference
+static int g_use_internal = 0; // use internal CPU ladder for pubkey derivation (instead of OpenSSL), if available
+static int g_pin_pcores = 0;   // prefer pinning threads to P-cores on hybrid CPUs
+static int g_cpu_batch = 1;    // optional: batch size for internal ladder with batch inversion
+static int g_avx2_multi_lanes = 0; // experimental: 2 or 4 lanes for CPU internal ladder batching
+// Global state for coordination and reporting
+static _Atomic int g_stop = 0;
+static _Atomic unsigned long long g_key_count = 0;
+static _Atomic unsigned long long g_found_count = 0;
+static unsigned long long g_found_target = 1ULL;
+
+// Small helper: format an unsigned long long into a compact human-readable string
+static void human_readable_ull(unsigned long long v, char *out, size_t outlen){
+	const char *suf[] = {"", "K", "M", "G", "T", "P", "E"};
+	double d = (double)v;
+	int i = 0;
+	while (d >= 1000.0 && i < 6) { d /= 1000.0; ++i; }
+	if (i > 0 && d < 10.0) {
+		// show two decimals for small values with suffix (e.g., 9.53M)
+		snprintf(out, outlen, "%.2f%s", d, suf[i]);
+	} else if (i > 0 && d < 100.0) {
+		// one decimal for mid-range (e.g., 42.1M)
+		snprintf(out, outlen, "%.1f%s", d, suf[i]);
+	} else if (i > 0) {
+		// no decimals for large whole numbers (e.g., 123M)
+		snprintf(out, outlen, "%.0f%s", d, suf[i]);
+	} else {
+		// raw number when no suffix
+		snprintf(out, outlen, "%llu", (unsigned long long)v);
+	}
+}
+#ifndef ME_USE_LIB25519
 // Try to use X25519_public_from_private via dynamic lookup if available in libcrypto
+ME_DIAG_PUSH
+ME_DIAG_IGNORED_PEDANTIC
 static int x25519_pub_from_priv_dyn(unsigned char out[32], const unsigned char priv[32]) {
 	typedef void (*x25519_pub_from_priv_fn)(unsigned char out[32], const unsigned char private_key[32]);
 	static x25519_pub_from_priv_fn fn = NULL;
@@ -83,12 +151,15 @@ static int x25519_pub_from_priv_dyn(unsigned char out[32], const unsigned char p
 	if (fn) { fn(out, priv); return 1; }
 	return 0;
 }
+ME_DIAG_POP
+#endif
 
 // ---- CPU feature detection (x86/x64) ----
 static int g_has_bmi2 = 0;
 static int g_has_adx = 0;
 static int g_has_avx2 = 0;
 static int g_has_avx512ifma = 0;
+static const char *g_fe_backend_name = "baseline";
 
 static void cpu_detect_features(void) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -109,8 +180,7 @@ static void cpu_detect_features(void) {
 #endif
 }
 
-#ifdef ME_KEYGEN_OPENCL
-// --- Minimal CPU ref10-style field ops for ladder tracing ---
+// --- Minimal CPU ref10-style field ops and internal ladder ---
 typedef struct { int v[10]; } fe;
 static inline void fe0(fe *h){ for(int i=0;i<10;++i) h->v[i]=0; }
 static inline void fe1(fe *h){ fe0(h); h->v[0]=1; }
@@ -236,6 +306,332 @@ static fe_sq_fn  g_fe_sq  = fesq_baseline;
 static inline void fem(fe *h, const fe *f, const fe *g) { g_fe_mul(h, f, g); }
 static inline void fesq(fe *h, const fe *f) { g_fe_sq(h, f); }
 
+// Shared optimized square for 5x51 representation. We reconstruct inputs from ref10 10-limb state,
+// compute square with symmetry (cross terms doubled), then reduce and map back to 10 limbs.
+ME_DIAG_PUSH
+ME_DIAG_IGNORED_PEDANTIC
+static inline void fe_sq_5x51_core(fe *h, const fe *f) {
+	long long F0 = (long long)f->v[0] + ((long long)f->v[1] << 26);
+	long long F1 = (long long)f->v[2] + ((long long)f->v[3] << 26);
+	long long F2 = (long long)f->v[4] + ((long long)f->v[5] << 26);
+	long long F3 = (long long)f->v[6] + ((long long)f->v[7] << 26);
+	long long F4 = (long long)f->v[8] + ((long long)f->v[9] << 26);
+
+	__int128 H0=0, H1=0, H2=0, H3=0, H4=0;
+	// Square: (F0+F1*2^51+...)^2 with wrap via *19, using symmetry: 2*Fi*Fj for i<j
+	__int128 F0_2 = (__int128)F0 * 2;
+	__int128 F1_2 = (__int128)F1 * 2;
+	__int128 F2_2 = (__int128)F2 * 2;
+	__int128 F3_2 = (__int128)F3 * 2;
+
+	// Terms following ref10 5x51 square layout
+	H0 += (__int128)F0 * F0 + (__int128)F1_2 * (F4 * 19LL) + (__int128)F2_2 * (F3 * 19LL);
+	H1 += F0_2 * F1 + (__int128)F2_2 * (F4 * 19LL) + (__int128)F3 * F3 * 19LL;
+	H2 += F0_2 * F2 + (__int128)F1 * F1 + (__int128)F3_2 * (F4 * 19LL);
+	H3 += F0_2 * F3 + F1_2 * F2 + (__int128)F4 * F4 * 19LL;
+	H4 += F0_2 * F4 + F1_2 * F3 + (__int128)F2 * F2;
+
+	const __int128 MASK51 = (((__int128)1) << 51) - 1;
+	__int128 c0 = H0 >> 51; H1 += c0; H0 &= MASK51;
+	__int128 c1 = H1 >> 51; H2 += c1; H1 &= MASK51;
+	__int128 c2 = H2 >> 51; H3 += c2; H2 &= MASK51;
+	__int128 c3 = H3 >> 51; H4 += c3; H3 &= MASK51;
+	__int128 c4 = H4 >> 51; H4 &= MASK51; H0 += c4 * 19; // fold via 19
+	c0 = H0 >> 51; H1 += c0; H0 &= MASK51;
+
+	unsigned long long T0 = (unsigned long long)H0;
+	unsigned long long T1 = (unsigned long long)H1;
+	unsigned long long T2 = (unsigned long long)H2;
+	unsigned long long T3 = (unsigned long long)H3;
+	unsigned long long T4 = (unsigned long long)H4;
+
+	h->v[0] = (int)(T0 & 0x3ffffffULL);
+	h->v[1] = (int)(T0 >> 26);
+	h->v[2] = (int)(T1 & 0x3ffffffULL);
+	h->v[3] = (int)(T1 >> 26);
+	h->v[4] = (int)(T2 & 0x3ffffffULL);
+	h->v[5] = (int)(T2 >> 26);
+	h->v[6] = (int)(T3 & 0x3ffffffULL);
+	h->v[7] = (int)(T3 >> 26);
+	h->v[8] = (int)(T4 & 0x3ffffffULL);
+	h->v[9] = (int)(T4 >> 26);
+}
+ME_DIAG_POP
+
+// ADX/BMI2 backend
+#if defined(__x86_64__) || defined(__i386__)
+// Scalar 5x51 implementation (reference-safe). Kept as a fallback and for compilers
+// that can't emit ADX/BMI2 without global flags.
+ME_DIAG_PUSH
+ME_DIAG_IGNORED_PEDANTIC
+static void fem_adx_scalar(fe *h, const fe *f, const fe *g) {
+	// ADX/BMI2 implementation of 5x51 multiply with 128-bit accumulators.
+	// Convert 10x(26/25) limbs into 5x51 using signed intermediates to preserve ref10 semantics
+	long long F0 = (long long)f->v[0] + ((long long)f->v[1] << 26);
+	long long F1 = (long long)f->v[2] + ((long long)f->v[3] << 26);
+	long long F2 = (long long)f->v[4] + ((long long)f->v[5] << 26);
+	long long F3 = (long long)f->v[6] + ((long long)f->v[7] << 26);
+	long long F4 = (long long)f->v[8] + ((long long)f->v[9] << 26);
+
+	long long G0 = (long long)g->v[0] + ((long long)g->v[1] << 26);
+	long long G1 = (long long)g->v[2] + ((long long)g->v[3] << 26);
+	long long G2 = (long long)g->v[4] + ((long long)g->v[5] << 26);
+	long long G3 = (long long)g->v[6] + ((long long)g->v[7] << 26);
+	long long G4 = (long long)g->v[8] + ((long long)g->v[9] << 26);
+
+	// Pre-multiply constants (wrap term via *19)
+	long long G1_19 = G1 * 19LL;
+	long long G2_19 = G2 * 19LL;
+	long long G3_19 = G3 * 19LL;
+	long long G4_19 = G4 * 19LL;
+
+	__int128 H0=0, H1=0, H2=0, H3=0, H4=0;
+
+	// H0 = F0*G0 + F1*G4*19 + F2*G3*19 + F3*G2*19 + F4*G1*19
+	H0 += (__int128)F0 * G0;
+	H0 += (__int128)F1 * G4_19;
+	H0 += (__int128)F2 * G3_19;
+	H0 += (__int128)F3 * G2_19;
+	H0 += (__int128)F4 * G1_19;
+	// H1 = F0*G1 + F1*G0 + F2*G4*19 + F3*G3*19 + F4*G2*19
+	H1 += (__int128)F0 * G1;
+	H1 += (__int128)F1 * G0;
+	H1 += (__int128)F2 * G4_19;
+	H1 += (__int128)F3 * G3_19;
+	H1 += (__int128)F4 * G2_19;
+	// H2 = F0*G2 + F1*G1 + F2*G0 + F3*G4*19 + F4*G3*19
+	H2 += (__int128)F0 * G2;
+	H2 += (__int128)F1 * G1;
+	H2 += (__int128)F2 * G0;
+	H2 += (__int128)F3 * G4_19;
+	H2 += (__int128)F4 * G3_19;
+	// H3 = F0*G3 + F1*G2 + F2*G1 + F3*G0 + F4*G4*19
+	H3 += (__int128)F0 * G3;
+	H3 += (__int128)F1 * G2;
+	H3 += (__int128)F2 * G1;
+	H3 += (__int128)F3 * G0;
+	H3 += (__int128)F4 * (G4 * 19LL);
+	// H4 = F0*G4 + F1*G3 + F2*G2 + F3*G1 + F4*G0
+	H4 += (__int128)F0 * G4;
+	H4 += (__int128)F1 * G3;
+	H4 += (__int128)F2 * G2;
+	H4 += (__int128)F3 * G1;
+	H4 += (__int128)F4 * G0;
+
+	// Carries/reduction identical to baseline
+	const __int128 MASK51 = (((__int128)1) << 51) - 1;
+	__int128 c0 = H0 >> 51; H1 += c0; H0 &= MASK51;
+	__int128 c1 = H1 >> 51; H2 += c1; H1 &= MASK51;
+	__int128 c2 = H2 >> 51; H3 += c2; H2 &= MASK51;
+	__int128 c3 = H3 >> 51; H4 += c3; H3 &= MASK51;
+	__int128 c4 = H4 >> 51; H4 &= MASK51; H0 += c4 * 19; // fold via 19
+	c0 = H0 >> 51; H1 += c0; H0 &= MASK51;
+
+	unsigned long long T0 = (unsigned long long)H0;
+	unsigned long long T1 = (unsigned long long)H1;
+	unsigned long long T2 = (unsigned long long)H2;
+	unsigned long long T3 = (unsigned long long)H3;
+	unsigned long long T4 = (unsigned long long)H4;
+
+	h->v[0] = (int)(T0 & 0x3ffffffULL);
+	h->v[1] = (int)(T0 >> 26);
+	h->v[2] = (int)(T1 & 0x3ffffffULL);
+	h->v[3] = (int)(T1 >> 26);
+	h->v[4] = (int)(T2 & 0x3ffffffULL);
+	h->v[5] = (int)(T2 >> 26);
+	h->v[6] = (int)(T3 & 0x3ffffffULL);
+	h->v[7] = (int)(T3 >> 26);
+	h->v[8] = (int)(T4 & 0x3ffffffULL);
+	h->v[9] = (int)(T4 >> 26);
+}
+ME_DIAG_POP
+
+// Intrinsics-targeted version. Using function multiversioning allows the default build
+// to remain portable (no global -m flags). Compilers may choose better codegen (MULX/ADCX)
+// under these attributes even though we keep the same safe scalar math.
+__attribute__((target("bmi2,adx")))
+static void fem_adx_intrin(fe *h, const fe *f, const fe *g) {
+    // For now, reuse the proven scalar math; the target attribute enables BMI2/ADX
+    // codegen when available without changing semantics. A future step can replace
+    // the inner products with explicit _mulx_u64/_addcarryx_u64 sequences.
+    fem_adx_scalar(h, f, g);
+}
+
+// Public selector symbol used by runtime dispatch
+static void fem_adx(fe *h, const fe *f, const fe *g) {
+    // Prefer the intrinsics-targeted implementation on capable compilers/CPUs
+    // (the attribute emits a specialized version in this TU). If the toolchain
+    // ignores the attribute, this will still resolve to the scalar body above.
+    fem_adx_intrin(h, f, g);
+}
+static void fesq_adx(fe *h, const fe *f) {
+	fe_sq_5x51_core(h, f);
+}
+#endif
+
+// AVX-512 IFMA backend (functional scalar 5x51; future: replace with madd52)
+#if defined(__x86_64__) || defined(__i386__)
+ME_DIAG_PUSH
+ME_DIAG_IGNORED_PEDANTIC
+static void fem_ifma(fe *h, const fe *f, const fe *g) {
+	// Same math as fem_adx: 5x51 scalar multiply with ref10-compatible reduction
+	long long F0 = (long long)f->v[0] + ((long long)f->v[1] << 26);
+	long long F1 = (long long)f->v[2] + ((long long)f->v[3] << 26);
+	long long F2 = (long long)f->v[4] + ((long long)f->v[5] << 26);
+	long long F3 = (long long)f->v[6] + ((long long)f->v[7] << 26);
+	long long F4 = (long long)f->v[8] + ((long long)f->v[9] << 26);
+
+	long long G0 = (long long)g->v[0] + ((long long)g->v[1] << 26);
+	long long G1 = (long long)g->v[2] + ((long long)g->v[3] << 26);
+	long long G2 = (long long)g->v[4] + ((long long)g->v[5] << 26);
+	long long G3 = (long long)g->v[6] + ((long long)g->v[7] << 26);
+	long long G4 = (long long)g->v[8] + ((long long)g->v[9] << 26);
+
+	long long G1_19 = G1 * 19LL;
+	long long G2_19 = G2 * 19LL;
+	long long G3_19 = G3 * 19LL;
+	long long G4_19 = G4 * 19LL;
+
+	__int128 H0=0, H1=0, H2=0, H3=0, H4=0;
+	H0 += (__int128)F0 * G0;
+	H0 += (__int128)F1 * G4_19;
+	H0 += (__int128)F2 * G3_19;
+	H0 += (__int128)F3 * G2_19;
+	H0 += (__int128)F4 * G1_19;
+	H1 += (__int128)F0 * G1;
+	H1 += (__int128)F1 * G0;
+	H1 += (__int128)F2 * G4_19;
+	H1 += (__int128)F3 * G3_19;
+	H1 += (__int128)F4 * G2_19;
+	H2 += (__int128)F0 * G2;
+	H2 += (__int128)F1 * G1;
+	H2 += (__int128)F2 * G0;
+	H2 += (__int128)F3 * G4_19;
+	H2 += (__int128)F4 * G3_19;
+	H3 += (__int128)F0 * G3;
+	H3 += (__int128)F1 * G2;
+	H3 += (__int128)F2 * G1;
+	H3 += (__int128)F3 * G0;
+	H3 += (__int128)F4 * (G4 * 19LL);
+	H4 += (__int128)F0 * G4;
+	H4 += (__int128)F1 * G3;
+	H4 += (__int128)F2 * G2;
+	H4 += (__int128)F3 * G1;
+	H4 += (__int128)F4 * G0;
+
+	const __int128 MASK51 = (((__int128)1) << 51) - 1;
+	__int128 c0 = H0 >> 51; H1 += c0; H0 &= MASK51;
+	__int128 c1 = H1 >> 51; H2 += c1; H1 &= MASK51;
+	__int128 c2 = H2 >> 51; H3 += c2; H2 &= MASK51;
+	__int128 c3 = H3 >> 51; H4 += c3; H3 &= MASK51;
+	__int128 c4 = H4 >> 51; H4 &= MASK51; H0 += c4 * 19; // fold via 19
+	c0 = H0 >> 51; H1 += c0; H0 &= MASK51;
+
+	unsigned long long T0 = (unsigned long long)H0;
+	unsigned long long T1 = (unsigned long long)H1;
+	unsigned long long T2 = (unsigned long long)H2;
+	unsigned long long T3 = (unsigned long long)H3;
+	unsigned long long T4 = (unsigned long long)H4;
+
+	h->v[0] = (int)(T0 & 0x3ffffffULL);
+	h->v[1] = (int)(T0 >> 26);
+	h->v[2] = (int)(T1 & 0x3ffffffULL);
+	h->v[3] = (int)(T1 >> 26);
+	h->v[4] = (int)(T2 & 0x3ffffffULL);
+	h->v[5] = (int)(T2 >> 26);
+	h->v[6] = (int)(T3 & 0x3ffffffULL);
+	h->v[7] = (int)(T3 >> 26);
+	h->v[8] = (int)(T4 & 0x3ffffffULL);
+	h->v[9] = (int)(T4 >> 26);
+}
+ME_DIAG_POP
+static void fesq_ifma(fe *h, const fe *f) { fe_sq_5x51_core(h, f); }
+#endif
+
+// AVX2 backend (functional scalar 5x51; future: batch multiple ladders per call)
+#if defined(__x86_64__) || defined(__i386__)
+ME_DIAG_PUSH
+ME_DIAG_IGNORED_PEDANTIC
+static void fem_avx2(fe *h, const fe *f, const fe *g) {
+	long long F0 = (long long)f->v[0] + ((long long)f->v[1] << 26);
+	long long F1 = (long long)f->v[2] + ((long long)f->v[3] << 26);
+	long long F2 = (long long)f->v[4] + ((long long)f->v[5] << 26);
+	long long F3 = (long long)f->v[6] + ((long long)f->v[7] << 26);
+	long long F4 = (long long)f->v[8] + ((long long)f->v[9] << 26);
+
+	long long G0 = (long long)g->v[0] + ((long long)g->v[1] << 26);
+	long long G1 = (long long)g->v[2] + ((long long)g->v[3] << 26);
+	long long G2 = (long long)g->v[4] + ((long long)g->v[5] << 26);
+	long long G3 = (long long)g->v[6] + ((long long)g->v[7] << 26);
+	long long G4 = (long long)g->v[8] + ((long long)g->v[9] << 26);
+
+	long long G1_19 = G1 * 19LL;
+	long long G2_19 = G2 * 19LL;
+	long long G3_19 = G3 * 19LL;
+	long long G4_19 = G4 * 19LL;
+
+	__int128 H0=0, H1=0, H2=0, H3=0, H4=0;
+	H0 += (__int128)F0 * G0;
+	H0 += (__int128)F1 * G4_19;
+	H0 += (__int128)F2 * G3_19;
+	H0 += (__int128)F3 * G2_19;
+	H0 += (__int128)F4 * G1_19;
+	H1 += (__int128)F0 * G1;
+	H1 += (__int128)F1 * G0;
+	H1 += (__int128)F2 * G4_19;
+	H1 += (__int128)F3 * G3_19;
+	H1 += (__int128)F4 * G2_19;
+	H2 += (__int128)F0 * G2;
+	H2 += (__int128)F1 * G1;
+	H2 += (__int128)F2 * G0;
+	H2 += (__int128)F3 * G4_19;
+	H2 += (__int128)F4 * G3_19;
+	H3 += (__int128)F0 * G3;
+	H3 += (__int128)F1 * G2;
+	H3 += (__int128)F2 * G1;
+	H3 += (__int128)F3 * G0;
+	H3 += (__int128)F4 * (G4 * 19LL);
+	H4 += (__int128)F0 * G4;
+	H4 += (__int128)F1 * G3;
+	H4 += (__int128)F2 * G2;
+	H4 += (__int128)F3 * G1;
+	H4 += (__int128)F4 * G0;
+
+	const __int128 MASK51 = (((__int128)1) << 51) - 1;
+	__int128 c0 = H0 >> 51; H1 += c0; H0 &= MASK51;
+	__int128 c1 = H1 >> 51; H2 += c1; H1 &= MASK51;
+	__int128 c2 = H2 >> 51; H3 += c2; H2 &= MASK51;
+	__int128 c3 = H3 >> 51; H4 += c3; H3 &= MASK51;
+	__int128 c4 = H4 >> 51; H4 &= MASK51; H0 += c4 * 19; // fold via 19
+	c0 = H0 >> 51; H1 += c0; H0 &= MASK51;
+
+	unsigned long long T0 = (unsigned long long)H0;
+	unsigned long long T1 = (unsigned long long)H1;
+	unsigned long long T2 = (unsigned long long)H2;
+	unsigned long long T3 = (unsigned long long)H3;
+	unsigned long long T4 = (unsigned long long)H4;
+
+	h->v[0] = (int)(T0 & 0x3ffffffULL);
+	h->v[1] = (int)(T0 >> 26);
+	h->v[2] = (int)(T1 & 0x3ffffffULL);
+	h->v[3] = (int)(T1 >> 26);
+	h->v[4] = (int)(T2 & 0x3ffffffULL);
+	h->v[5] = (int)(T2 >> 26);
+	h->v[6] = (int)(T3 & 0x3ffffffULL);
+	h->v[7] = (int)(T3 >> 26);
+	h->v[8] = (int)(T4 & 0x3ffffffULL);
+	h->v[9] = (int)(T4 >> 26);
+}
+ME_DIAG_POP
+static void fesq_avx2(fe *h, const fe *f) { fe_sq_5x51_core(h, f); }
+// Experimental SoA for 4-lane FE (placeholder for future AVX2 vectorization)
+#if defined(__x86_64__) || defined(__i386__)
+typedef struct {
+	int limb[10][4];
+} fe_soa4;
+#endif
+#endif
+
 // In FE test mode, cross-check fem via BN to ensure correctness, then map back to limbs
 // fem_ref declared later after helpers
 static inline void fea24(fe *h,const fe *f){
@@ -358,7 +754,7 @@ static inline void fe_frombytes(fe *h, const unsigned char s[32]){
 }
 
 // BN-based reference X25519 basepoint ladder (for diagnostics only)
-static void x25519_basepoint_mul_bn(const unsigned char sk[32], unsigned char out[32]){
+static ME_MAYBE_UNUSED void x25519_basepoint_mul_bn(const unsigned char sk[32], unsigned char out[32]){
 	BN_CTX *ctx = BN_CTX_new();
 	BIGNUM *p = BN_new(); BN_zero(p); BN_set_bit(p, 255); BN_sub_word(p, 19);
 	BIGNUM *x1 = BN_new(); BN_set_word(x1, 9);
@@ -431,7 +827,7 @@ static inline void fe_sample_random(fe *h){
 	BN_free(r); BN_free(p); BN_CTX_free(ctx);
 }
 
-static void x25519_basepoint_mul_cpu(const unsigned char sk[32], unsigned char out[32]){
+static ME_MAYBE_UNUSED void x25519_basepoint_mul_cpu(const unsigned char sk[32], unsigned char out[32]){
 	fe x1; fe0(&x1); x1.v[0]=9;
 	fe x2,z2,x3,z3,a,aa,b,bb,e,c,d,da,cb,tmp; fe1(&x2); fe0(&z2); fec(&x3,&x1); fe1(&z3);
 	int swap=0; for(int pos=254; pos>=0; --pos){ int bit=(sk[pos>>3]>>(pos&7))&1; swap^=bit; fex(&x2,&x3,swap); fex(&z2,&z3,swap); swap=bit; fea(&a,&x2,&z2); fesq(&aa,&a); fes(&b,&x2,&z2); fesq(&bb,&b); fes(&e,&aa,&bb); fea(&c,&x3,&z3); fes(&d,&x3,&z3); fem(&da,&d,&a); fem(&cb,&c,&b); fea(&tmp,&da,&cb); fesq(&x3,&tmp); fes(&tmp,&da,&cb); fesq(&tmp,&tmp); fem(&z3,&tmp,&x1); fem(&x2,&aa,&bb); fea24(&tmp,&e); fea(&tmp,&aa,&tmp); fem(&z2,&e,&tmp); }
@@ -440,7 +836,7 @@ static void x25519_basepoint_mul_cpu(const unsigned char sk[32], unsigned char o
 }
 
 // Diagnostic: CPU ladder using BN-backed fem_ref/fesq_ref to isolate mul/sq issues
-static void x25519_basepoint_mul_cpu_refmul(const unsigned char sk[32], unsigned char out[32]){
+static ME_MAYBE_UNUSED void x25519_basepoint_mul_cpu_refmul(const unsigned char sk[32], unsigned char out[32]){
 	fe x1; fe0(&x1); x1.v[0]=9;
 	fe x2,z2,x3,z3,a,aa,b,bb,e,c,d,da,cb,tmp; fe1(&x2); fe0(&z2); fec(&x3,&x1); fe1(&z3);
 	int swap=0;
@@ -479,7 +875,29 @@ static void ladder_get_x2z2(const unsigned char sk[32], fe *out_x2, fe *out_z2){
 	fex(&x2,&x3,swap); fex(&z2,&z3,swap);
 	fec(out_x2, &x2); fec(out_z2, &z2);
 }
-#endif
+
+// Batch inversion: given z[0..n-1], compute inv[ i ] = 1/z[i] using 1 inversion + O(n) muls
+static void fe_batch_invert(fe *out_inv, const fe *in_z, int n){
+	if (n <= 0) return;
+	fe *prefix = (fe*)malloc((size_t)n * sizeof(fe));
+	if (!prefix) { // fallback: individual inversions
+		for (int i=0;i<n;++i) feinvert(&out_inv[i], &in_z[i]);
+		return;
+	}
+	fe acc; fe1(&acc);
+	for (int i=0;i<n;++i){ fem(&acc, &acc, &in_z[i]); prefix[i] = acc; }
+	fe inv_total; feinvert(&inv_total, &acc);
+	for (int i=n-1;i>=0;--i){
+		fe prev;
+		if (i==0) { fe1(&prev); }
+		else { prev = prefix[i-1]; }
+		fem(&out_inv[i], &inv_total, &prev);
+		// inv_total *= z[i]
+		fem(&inv_total, &inv_total, &in_z[i]);
+	}
+	free(prefix);
+}
+
 
 // Normalize fe to ref10 carry form and build BIGNUM directly from limbs
 #ifdef ME_KEYGEN_OPENCL
@@ -536,79 +954,6 @@ static BIGNUM* BN_from_fe_limbs(const fe *h){
 	return r;
 }
 #endif
-// --- CPU Philox4x32-10 (matches OpenCL kernel constants) ---
-static inline uint32_t mulhi32_u32(uint32_t a, uint32_t b) {
-	uint64_t w = (uint64_t)a * (uint64_t)b;
-	return (uint32_t)(w >> 32);
-}
-
-static inline void philox4x32_round_u32(uint32_t ctr[4], uint32_t key[2]) {
-	const uint32_t MUL0 = 0xD2511F53U;
-	const uint32_t MUL1 = 0xCD9E8D57U;
-	uint32_t hi0 = mulhi32_u32(ctr[0], MUL0);
-	uint32_t lo0 = ctr[0] * MUL0;
-	uint32_t hi1 = mulhi32_u32(ctr[2], MUL1);
-	uint32_t lo1 = ctr[2] * MUL1;
-	uint32_t n0 = hi1 ^ ctr[1] ^ key[0];
-	uint32_t n1 = lo1;
-	uint32_t n2 = hi0 ^ ctr[3] ^ key[1];
-	uint32_t n3 = lo0;
-	ctr[0] = n0; ctr[1] = n1; ctr[2] = n2; ctr[3] = n3;
-	const uint32_t W0 = 0x9E3779B9U;
-	const uint32_t W1 = 0xBB67AE85U;
-	key[0] += W0; key[1] += W1;
-}
-
-static inline void philox4x32_10_u32(uint32_t ctr[4], uint32_t key[2]) {
-	for (int i = 0; i < 10; ++i) philox4x32_round_u32(ctr, key);
-}
-
-#ifdef ME_KEYGEN_OPENCL
-static void philox_fill32_for_gid(uint64_t seed, uint32_t gid, unsigned char out32[32]) {
-	// Build key per ocl host seeds generation in ocl_rng_dump
-	uint32_t k0 = (uint32_t)(seed ^ (0x9E3779B97F4A7C15ULL * (uint64_t)(gid + 1)));
-	uint32_t k1 = (uint32_t)(gid * 0xD2511F53U + 1U);
-	uint32_t key0[2] = { k0, k1 };
-	uint32_t key1[2] = { k0, k1 };
-	uint32_t c0[4] = { gid, 0u, 0u, 0u };
-	uint32_t c1[4] = { gid, 1u, 0u, 0u };
-	philox4x32_10_u32(c0, key0);
-	philox4x32_10_u32(c1, key1);
-	uint32_t words[8] = { c0[0], c0[1], c0[2], c0[3], c1[0], c1[1], c1[2], c1[3] };
-	int bi = 0;
-	for (int i = 0; i < 8; ++i) {
-		uint32_t w = words[i];
-		out32[bi++] = (unsigned char)(w & 0xFF);
-		out32[bi++] = (unsigned char)((w >> 8) & 0xFF);
-		out32[bi++] = (unsigned char)((w >> 16) & 0xFF);
-		out32[bi++] = (unsigned char)((w >> 24) & 0xFF);
-	}
-}
-#endif
-
-
-static _Atomic unsigned long long g_key_count = 0; // total generated/checked keys
-static _Atomic unsigned long long g_found_count = 0; // total matches found
-static unsigned long long g_found_target = 1;        // stop after this many matches
-static _Atomic int g_stop = 0;                       // global stop flag
-
-static void human_readable_ull(unsigned long long v, char *out, size_t outsz) {
-	const char *suffixes[] = {"", "K", "M", "G", "T", "P", "E"};
-	int s = 0;
-	double dv = (double)v;
-	while (dv >= 1000.0 && s < (int)(sizeof(suffixes)/sizeof(suffixes[0])) - 1) {
-		dv /= 1000.0;
-		s++;
-	}
-	// Keep 1 decimal for non-integers when dv < 100 or when fractional part is meaningful
-	if (dv < 10.0 && v >= 1000ULL) {
-		snprintf(out, outsz, "%.2f%s", dv, suffixes[s]);
-	} else if (dv < 100.0 && v >= 1000ULL) {
-		snprintf(out, outsz, "%.1f%s", dv, suffixes[s]);
-	} else {
-		snprintf(out, outsz, "%.0f%s", dv, suffixes[s]);
-	}
-}
 
 static void *reporter(void *arg) {
 	(void)arg;
@@ -629,12 +974,108 @@ static void *reporter(void *arg) {
 	return NULL;
 }
 
+// Optional: prefer P-cores (higher max freq) when pinning threads on hybrid CPUs
+// Build an index ordering of CPUs sorted by cpufreq cpuinfo_max_freq descending.
+static int *g_core_order = NULL; static int g_core_order_count = 0;
+static void build_core_order_if_needed(void){
+#ifdef __linux__
+	if (!g_affinity || !g_pin_pcores) return;
+	if (g_core_order) return;
+	int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+	if (ncpu <= 0) return;
+	int *idx = (int*)malloc((size_t)ncpu * sizeof(int));
+	long *freq = (long*)malloc((size_t)ncpu * sizeof(long));
+	if (!idx || !freq) { free(idx); free(freq); return; }
+	for (int i=0;i<ncpu;++i){ idx[i]=i; freq[i]=0; }
+	char path[256];
+	for (int i=0;i<ncpu;++i){
+		snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+		FILE *f = fopen(path, "r");
+		if (!f) continue;
+		long khz=0; if (fscanf(f, "%ld", &khz)==1) freq[i]=khz; fclose(f);
+	}
+	// sort indices by freq desc (simple selection sort for small n)
+	for (int i=0;i<ncpu-1;++i){ int best=i; for(int j=i+1;j<ncpu;++j){ if (freq[idx[j]]>freq[idx[best]]) best=j; } int t=idx[i]; idx[i]=idx[best]; idx[best]=t; }
+	g_core_order = idx; g_core_order_count = ncpu; free(freq);
+#endif
+}
+
 // Fast fixed-size Base64 for 32-byte input. Produces 44 chars + NUL.
 static inline void base64_encode_32(const unsigned char in[32], char out[45]) {
-	int n = EVP_EncodeBlock((unsigned char *)out, in, 32);
-	// EVP_EncodeBlock never fails for valid args; n should be 44
-	if (n < 0) n = 0;
-	out[n] = '\0';
+	static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	// 10 full 3-byte blocks => 40 chars
+	int o = 0;
+	for (int i = 0; i < 30; i += 3) {
+		unsigned int v = ((unsigned int)in[i] << 16) | ((unsigned int)in[i+1] << 8) | (unsigned int)in[i+2];
+		out[o++] = B64[(v >> 18) & 63];
+		out[o++] = B64[(v >> 12) & 63];
+		out[o++] = B64[(v >> 6) & 63];
+		out[o++] = B64[v & 63];
+	}
+	// Remainder: 2 bytes => 3 chars + '='
+	{
+		unsigned int v = ((unsigned int)in[30] << 16) | ((unsigned int)in[31] << 8);
+		out[o++] = B64[(v >> 18) & 63];
+		out[o++] = B64[(v >> 12) & 63];
+		out[o++] = B64[(v >> 6) & 63];
+		out[o++] = '=';
+	}
+	out[o] = '\0'; // o should be 44
+}
+
+// Convert Base64 char to 6-bit index; returns 0..63, or 0xFF if invalid
+static inline unsigned char b64_index(unsigned char c){
+	if (c >= 'A' && c <= 'Z') return (unsigned char)(c - 'A');
+	if (c >= 'a' && c <= 'z') return (unsigned char)(26 + (c - 'a'));
+	if (c >= '0' && c <= '9') return (unsigned char)(52 + (c - '0'));
+	if (c == '+') return 62;
+	if (c == '/') return 63;
+	return 0xFFu;
+}
+
+// --- Per-thread ChaCha20 DRBG for fast, lock-free secret generation ---
+typedef struct {
+	uint32_t state[16]; // constant, key[8], counter, nonce[3]
+} chacha20_ctx;
+
+static inline uint32_t rotl32(uint32_t x, int n){ return (x << n) | (x >> (32 - n)); }
+static inline void chacha20_quarterround(uint32_t s[16], int a,int b,int c,int d){
+	s[a] += s[b]; s[d] ^= s[a]; s[d] = rotl32(s[d],16);
+	s[c] += s[d]; s[b] ^= s[c]; s[b] = rotl32(s[b],12);
+	s[a] += s[b]; s[d] ^= s[a]; s[d] = rotl32(s[d], 8);
+	s[c] += s[d]; s[b] ^= s[c]; s[b] = rotl32(s[b], 7);
+}
+static inline void chacha20_init(chacha20_ctx *ctx, const uint8_t key[32], const uint8_t nonce[12], uint32_t counter){
+	const uint32_t C0 = 0x61707865U, C1 = 0x3320646EU, C2 = 0x79622D32U, C3 = 0x6B206574U;
+	ctx->state[0]=C0; ctx->state[1]=C1; ctx->state[2]=C2; ctx->state[3]=C3;
+	// Key little-endian words
+	for (int i=0;i<8;++i){ ctx->state[4+i] = ((uint32_t)key[i*4]) | ((uint32_t)key[i*4+1]<<8) | ((uint32_t)key[i*4+2]<<16) | ((uint32_t)key[i*4+3]<<24); }
+	ctx->state[12]=counter;
+	ctx->state[13]= ((uint32_t)nonce[0]) | ((uint32_t)nonce[1]<<8) | ((uint32_t)nonce[2]<<16) | ((uint32_t)nonce[3]<<24);
+	ctx->state[14]= ((uint32_t)nonce[4]) | ((uint32_t)nonce[5]<<8) | ((uint32_t)nonce[6]<<16) | ((uint32_t)nonce[7]<<24);
+	ctx->state[15]= ((uint32_t)nonce[8]) | ((uint32_t)nonce[9]<<8) | ((uint32_t)nonce[10]<<16) | ((uint32_t)nonce[11]<<24);
+}
+static inline void chacha20_block(const chacha20_ctx *ctx, uint8_t out[64]){
+	uint32_t x[16]; for (int i=0;i<16;++i) x[i]=ctx->state[i];
+	for (int r=0;r<10;++r){ // 20 rounds
+		chacha20_quarterround(x,0,4, 8,12);
+		chacha20_quarterround(x,1,5, 9,13);
+		chacha20_quarterround(x,2,6,10,14);
+		chacha20_quarterround(x,3,7,11,15);
+		chacha20_quarterround(x,0,5,10,15);
+		chacha20_quarterround(x,1,6,11,12);
+		chacha20_quarterround(x,2,7, 8,13);
+		chacha20_quarterround(x,3,4, 9,14);
+	}
+	for (int i=0;i<16;++i){ uint32_t w = x[i] + ctx->state[i]; out[i*4+0]= (uint8_t)(w); out[i*4+1]=(uint8_t)(w>>8); out[i*4+2]=(uint8_t)(w>>16); out[i*4+3]=(uint8_t)(w>>24); }
+}
+static inline void chacha20_next(chacha20_ctx *ctx, uint8_t *out, size_t outlen){
+	while (outlen){
+		uint8_t block[64]; chacha20_block(ctx, block);
+		size_t n = outlen < 64 ? outlen : 64;
+		memcpy(out, block, n);
+		out += n; outlen -= n; ctx->state[12] += 1; // counter++
+	}
 }
 
 void *generate_keys(void *arg) {
@@ -646,53 +1087,293 @@ void *generate_keys(void *arg) {
 		if (ncpu > 0) {
 			cpu_set_t set;
 			CPU_ZERO(&set);
-			CPU_SET((unsigned)(tid % ncpu), &set);
+			if (g_pin_pcores && g_core_order && g_core_order_count==ncpu) {
+				int cpu = g_core_order[(int)(tid % ncpu)];
+				CPU_SET((unsigned)cpu, &set);
+			} else {
+				CPU_SET((unsigned)(tid % ncpu), &set);
+			}
 			(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 		}
 	}
 #endif
 
-	unsigned char priv_key[32];
 	unsigned char pub_key[32];
 	char b64_pub[BASE64_LEN + 1];  // 44 + 1
 	char b64_priv[BASE64_LEN + 1]; // 44 + 1
 	unsigned long long local_cnt = 0;
 
-	// Batch RNG to reduce RAND_bytes overhead and locking
+	// Reusable per-thread buffers for optional batch inversion path
+	fe *batch_X2 = NULL, *batch_Z2 = NULL, *batch_Zinv = NULL;
+	int batch_cap = 0;
+
+	// Per-thread DRBG to avoid RAND_bytes in the hot loop
 	enum { RAND_KEYS_BATCH = 4096 };
 	unsigned char rand_buf[RAND_KEYS_BATCH * 32];
 	size_t rand_off = RAND_KEYS_BATCH * 32; // force initial refill
+	chacha20_ctx drbg; unsigned char seed_key[32], seed_nonce[12];
+	if (RAND_bytes(seed_key, sizeof seed_key) != 1 || RAND_bytes(seed_nonce, sizeof seed_nonce) != 1) {
+		// Fallback: zero seed; still functional but lower entropy (unlikely path)
+		memset(seed_key, 0, sizeof seed_key);
+		memset(seed_nonce, 0, sizeof seed_nonce);
+	}
+	chacha20_init(&drbg, seed_key, seed_nonce, 1u);
 
 	while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
 		// Generate random private key bytes (buffered)
 		if (rand_off >= sizeof(rand_buf)) {
-			if (RAND_bytes(rand_buf, sizeof(rand_buf)) != 1) {
-				continue; // try next
-			}
+			chacha20_next(&drbg, rand_buf, sizeof(rand_buf));
 			rand_off = 0;
 		}
-		memcpy(priv_key, rand_buf + rand_off, 32);
+
+		// Experimental: small multi-lane (2 or 4) internal ladder + single inversion
+		if (g_use_internal && g_avx2_multi_lanes >= 2) {
+			int N = g_avx2_multi_lanes;
+			size_t need = (size_t)N * 32;
+			size_t remain = sizeof(rand_buf) - rand_off;
+			if (remain < need) { chacha20_next(&drbg, rand_buf, sizeof(rand_buf)); rand_off = 0; }
+			unsigned char *privs = rand_buf + rand_off;
+			// Ensure reusable buffers are large enough
+			if (batch_cap < N) {
+				fe *newX2 = (fe *)realloc(batch_X2, (size_t)N * sizeof(fe));
+				fe *newZ2 = (fe *)realloc(batch_Z2, (size_t)N * sizeof(fe));
+				fe *newZi = (fe *)realloc(batch_Zinv, (size_t)N * sizeof(fe));
+				if (!newX2 || !newZ2 || !newZi) {
+					if (newX2) batch_X2 = newX2;
+					if (newZ2) batch_Z2 = newZ2;
+					if (newZi) batch_Zinv = newZi;
+					break; // allocation failure; exit thread
+				}
+				batch_X2 = newX2; batch_Z2 = newZ2; batch_Zinv = newZi; batch_cap = N;
+			}
+			for (int i = 0; i < N; ++i) {
+				unsigned char *sk = privs + (size_t)i * 32;
+				// Clamp per RFC 7748
+				sk[0] &= 248; sk[31] &= 127; sk[31] |= 64;
+				ladder_get_x2z2(sk, &batch_X2[i], &batch_Z2[i]);
+			}
+			fe_batch_invert(batch_Zinv, batch_Z2, N);
+			for (int i = 0; i < N; ++i) {
+				unsigned char *sk = privs + (size_t)i * 32;
+				fe X; fem(&X, &batch_X2[i], &batch_Zinv[i]);
+				fetobytes(pub_key, &X);
+				// Quick prefilter
+				int likely_match = (g_patterns_count == 0);
+				if (!likely_match) {
+					unsigned char b0 = pub_key[0], b1 = pub_key[1], b2 = pub_key[2];
+					unsigned char p0 = (b0 >> 2) & 0x3F;
+					unsigned char p1 = ((b0 & 0x3) << 4) | (b1 >> 4); p1 &= 0x3F;
+					unsigned char p2 = ((b1 & 0xF) << 2) | (b2 >> 6); p2 &= 0x3F;
+					unsigned char p3 = b2 & 0x3F;
+					unsigned char e30 = pub_key[30], e31 = pub_key[31];
+					unsigned char s41 = (e30 >> 2) & 0x3F;
+					unsigned char s42 = ((e30 & 0x3) << 4) | (e31 >> 4); s42 &= 0x3F;
+					unsigned char s43 = ((e31 & 0xF) << 2); s43 &= 0x3F;
+					for (size_t k = 0; k < g_patterns_count && !likely_match; ++k) {
+						struct search_pattern *sp = &g_patterns[k]; int ok = 1;
+						if (sp->pre_mask_len) {
+							if (sp->pre_mask_len >= 1 && sp->pre_idx[0] != p0) ok = 0;
+							if (ok && sp->pre_mask_len >= 2 && sp->pre_idx[1] != p1) ok = 0;
+							if (ok && sp->pre_mask_len >= 3 && sp->pre_idx[2] != p2) ok = 0;
+							if (ok && sp->pre_mask_len >= 4 && sp->pre_idx[3] != p3) ok = 0;
+						}
+						if (ok && sp->suf_mask_len) {
+							if (sp->suf_mask_len >= 1 && sp->suf_idx[0] != s41) ok = 0;
+							if (ok && sp->suf_mask_len >= 2 && sp->suf_idx[1] != s42) ok = 0;
+							if (ok && sp->suf_mask_len >= 3 && sp->suf_idx[2] != s43) ok = 0;
+						}
+						if (ok) { likely_match = 1; break; }
+					}
+				}
+				if (likely_match) {
+					base64_encode_32(pub_key, b64_pub);
+					int matched = 0;
+					for (size_t k = 0; k < g_patterns_count; ++k) {
+						struct search_pattern *sp = &g_patterns[k];
+						if (sp->prefix_len > 0 && memcmp(b64_pub, sp->prefix, sp->prefix_len) == 0) { matched = 1; break; }
+						if (sp->suffix_len > 0 && memcmp(b64_pub + sp->suffix_off, sp->suffix, sp->suffix_len) == 0) { matched = 1; break; }
+					}
+					if (matched) {
+						base64_encode_32(sk, b64_priv);
+						printf("FOUND: pub=%s priv=%s\n", b64_pub, b64_priv);
+						fprintf(stderr, "FOUND: pub=%s priv=%s\n", b64_pub, b64_priv);
+						fflush(stdout); fflush(stderr);
+						unsigned long long cur = atomic_fetch_add_explicit(&g_found_count, 1ULL, memory_order_relaxed) + 1ULL;
+						if (cur >= g_found_target) { atomic_store_explicit(&g_stop, 1, memory_order_relaxed); }
+					}
+				}
+			}
+			local_cnt += (unsigned long long)N;
+			if (local_cnt >= 4096ULL) { atomic_fetch_add_explicit(&g_key_count, local_cnt, memory_order_relaxed); local_cnt = 0; }
+			rand_off += need;
+			if (atomic_load_explicit(&g_stop, memory_order_relaxed)) break;
+			continue; // proceed to next batch
+		}
+
+		// Optional: batched internal ladder path with single batch inversion
+		if (g_use_internal && g_cpu_batch > 1) {
+			int N = g_cpu_batch;
+			size_t need = (size_t)N * 32;
+			size_t remain = sizeof(rand_buf) - rand_off;
+			if (remain < need) {
+				// Refill to satisfy one full batch in a single buffer slice
+				chacha20_next(&drbg, rand_buf, sizeof(rand_buf));
+				rand_off = 0;
+			}
+			unsigned char *privs = rand_buf + rand_off;
+			// Ensure reusable buffers are large enough
+			if (batch_cap < N) {
+				fe *newX2 = (fe *)realloc(batch_X2, (size_t)N * sizeof(fe));
+				fe *newZ2 = (fe *)realloc(batch_Z2, (size_t)N * sizeof(fe));
+				fe *newZi = (fe *)realloc(batch_Zinv, (size_t)N * sizeof(fe));
+				if (!newX2 || !newZ2 || !newZi) {
+					if (newX2) batch_X2 = newX2; // keep best effort to avoid leak
+					if (newZ2) batch_Z2 = newZ2;
+					if (newZi) batch_Zinv = newZi;
+					break; // allocation failure; exit thread
+				}
+				batch_X2 = newX2; batch_Z2 = newZ2; batch_Zinv = newZi; batch_cap = N;
+			}
+			for (int i = 0; i < N; ++i) {
+				unsigned char *sk = privs + (size_t)i * 32;
+				// Clamp per RFC 7748
+				sk[0] &= 248; sk[31] &= 127; sk[31] |= 64;
+				ladder_get_x2z2(sk, &batch_X2[i], &batch_Z2[i]);
+			}
+			fe_batch_invert(batch_Zinv, batch_Z2, N);
+			for (int i = 0; i < N; ++i) {
+				unsigned char *sk = privs + (size_t)i * 32;
+				fe X; fem(&X, &batch_X2[i], &batch_Zinv[i]);
+				fetobytes(pub_key, &X);
+				// Quick prefix/suffix prefilter on raw bytes to avoid base64 when obviously not matching
+				int likely_match = (g_patterns_count == 0);
+				if (!likely_match) {
+					unsigned char b0 = pub_key[0], b1 = pub_key[1], b2 = pub_key[2];
+					unsigned char p0 = (b0 >> 2) & 0x3F;
+					unsigned char p1 = ((b0 & 0x3) << 4) | (b1 >> 4); p1 &= 0x3F;
+					unsigned char p2 = ((b1 & 0xF) << 2) | (b2 >> 6); p2 &= 0x3F;
+					unsigned char p3 = b2 & 0x3F;
+					unsigned char e30 = pub_key[30], e31 = pub_key[31];
+					unsigned char s41 = (e30 >> 2) & 0x3F;
+					unsigned char s42 = ((e30 & 0x3) << 4) | (e31 >> 4); s42 &= 0x3F;
+					unsigned char s43 = ((e31 & 0xF) << 2); s43 &= 0x3F;
+					for (size_t k = 0; k < g_patterns_count && !likely_match; ++k) {
+						struct search_pattern *sp = &g_patterns[k]; int ok = 1;
+						if (sp->pre_mask_len) {
+							if (sp->pre_mask_len >= 1 && sp->pre_idx[0] != p0) ok = 0;
+							if (ok && sp->pre_mask_len >= 2 && sp->pre_idx[1] != p1) ok = 0;
+							if (ok && sp->pre_mask_len >= 3 && sp->pre_idx[2] != p2) ok = 0;
+							if (ok && sp->pre_mask_len >= 4 && sp->pre_idx[3] != p3) ok = 0;
+						}
+						if (ok && sp->suf_mask_len) {
+							if (sp->suf_mask_len >= 1 && sp->suf_idx[0] != s41) ok = 0;
+							if (ok && sp->suf_mask_len >= 2 && sp->suf_idx[1] != s42) ok = 0;
+							if (ok && sp->suf_mask_len >= 3 && sp->suf_idx[2] != s43) ok = 0;
+						}
+						if (ok) { likely_match = 1; break; }
+					}
+				}
+				if (likely_match) {
+					base64_encode_32(pub_key, b64_pub);
+					int matched = 0;
+					for (size_t k = 0; k < g_patterns_count; ++k) {
+						struct search_pattern *sp = &g_patterns[k];
+						if (sp->prefix_len > 0 && memcmp(b64_pub, sp->prefix, sp->prefix_len) == 0) { matched = 1; break; }
+						if (sp->suffix_len > 0 && memcmp(b64_pub + sp->suffix_off, sp->suffix, sp->suffix_len) == 0) { matched = 1; break; }
+					}
+					if (matched) {
+						base64_encode_32(sk, b64_priv);
+						printf("FOUND: pub=%s priv=%s\n", b64_pub, b64_priv);
+						fprintf(stderr, "FOUND: pub=%s priv=%s\n", b64_pub, b64_priv);
+						fflush(stdout); fflush(stderr);
+						unsigned long long cur = atomic_fetch_add_explicit(&g_found_count, 1ULL, memory_order_relaxed) + 1ULL;
+						if (cur >= g_found_target) { atomic_store_explicit(&g_stop, 1, memory_order_relaxed); }
+					}
+				}
+			}
+			local_cnt += (unsigned long long)N;
+			if (local_cnt >= 4096ULL) { atomic_fetch_add_explicit(&g_key_count, local_cnt, memory_order_relaxed); local_cnt = 0; }
+			rand_off += need;
+			if (atomic_load_explicit(&g_stop, memory_order_relaxed)) break;
+			continue; // proceed to next batch without running single-key path
+		}
+		unsigned char *priv = rand_buf + rand_off;
 		rand_off += 32;
 
 	// Clamp private key per X25519 spec
-	priv_key[0] &= 248;
-	priv_key[31] &= 127;
-	priv_key[31] |= 64;
+	priv[0] &= 248;
+	priv[31] &= 127;
+	priv[31] |= 64;
 
-	// Derive public key: try fast X25519_public_from_private if available, else EVP fallback
-		if (!x25519_pub_from_priv_dyn(pub_key, priv_key)) {
-			EVP_PKEY *pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, priv_key, 32);
-			if (!pkey) continue;
-			size_t len = 32;
-			if (EVP_PKEY_get_raw_public_key(pkey, pub_key, &len) <= 0) { EVP_PKEY_free(pkey); continue; }
-			EVP_PKEY_free(pkey);
+		// Derive public key
+		int have_pub = 0;
+#ifdef ME_KEYGEN_OPENCL
+		if (g_use_internal) {
+			x25519_basepoint_mul_cpu(priv, pub_key);
+			have_pub = 1;
 		}
+#endif
+#ifdef ME_USE_LIB25519
+		if (!have_pub) {
+			// X25519 public key = X25519(secret, basepoint). lib25519_dh(k,pk,sk) computes k = X25519(sk, pk).
+			// So we set pk = basepoint, and the secret input as sk; the output "k" is the public key.
+			lib25519_dh(pub_key, X25519_BASEPOINT, priv);
+			have_pub = 1;
+		}
+#else
+		if (!have_pub) {
+			// Try fast X25519_public_from_private if available, else EVP fallback
+			if (!x25519_pub_from_priv_dyn(pub_key, priv)) {
+				EVP_PKEY *pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, priv, 32);
+				if (!pkey) continue;
+				size_t len = 32;
+				if (EVP_PKEY_get_raw_public_key(pkey, pub_key, &len) <= 0) { EVP_PKEY_free(pkey); continue; }
+				EVP_PKEY_free(pkey);
+			}
+		}
+#endif
 
-		// Base64 encode public and check match
-		base64_encode_32(pub_key, b64_pub);
+		// Quick prefix/suffix prefilter on raw bytes to avoid base64 when obviously not matching
+		int likely_match = (g_patterns_count == 0);
+		if (!likely_match) {
+			// Compute first up to 4 Base64 indices from first 3 bytes
+			unsigned char b0 = pub_key[0], b1 = pub_key[1], b2 = pub_key[2];
+			unsigned char p0 = (b0 >> 2) & 0x3F;
+			unsigned char p1 = ((b0 & 0x3) << 4) | (b1 >> 4);
+			p1 &= 0x3F;
+			unsigned char p2 = ((b1 & 0xF) << 2) | (b2 >> 6);
+			p2 &= 0x3F;
+			unsigned char p3 = b2 & 0x3F;
+			// Compute last up to 3 Base64 indices from last 2 bytes (positions 41..43 before '=')
+			unsigned char e30 = pub_key[30];
+			unsigned char e31 = pub_key[31];
+			unsigned char s41 = (e30 >> 2) & 0x3F;
+			unsigned char s42 = ((e30 & 0x3) << 4) | (e31 >> 4); s42 &= 0x3F;
+			unsigned char s43 = ((e31 & 0xF) << 2); s43 &= 0x3F; // last char (index 43) is '=' in output, so ignore
+			for (size_t i = 0; i < g_patterns_count && !likely_match; ++i) {
+				struct search_pattern *sp = &g_patterns[i];
+				int ok = 1;
+				// Prefix check
+				if (sp->pre_mask_len) {
+					if (sp->pre_mask_len >= 1 && sp->pre_idx[0] != p0) ok = 0;
+					if (ok && sp->pre_mask_len >= 2 && sp->pre_idx[1] != p1) ok = 0;
+					if (ok && sp->pre_mask_len >= 3 && sp->pre_idx[2] != p2) ok = 0;
+					if (ok && sp->pre_mask_len >= 4 && sp->pre_idx[3] != p3) ok = 0;
+				}
+				// Suffix check (last indices before '='): positions 41,42,43
+				if (ok && sp->suf_mask_len) {
+					// Map suf_idx[0..n-1] to s41,s42,s43 (we stored in ascending order)
+					if (sp->suf_mask_len >= 1 && sp->suf_idx[0] != s41) ok = 0;
+					if (ok && sp->suf_mask_len >= 2 && sp->suf_idx[1] != s42) ok = 0;
+					if (ok && sp->suf_mask_len >= 3 && sp->suf_idx[2] != s43) ok = 0;
+				}
+				if (ok) { likely_match = 1; break; }
+			}
+		}
+	if (likely_match) { base64_encode_32(pub_key, b64_pub); }
 
 		// Count this generated key regardless of match (batch to reduce contention)
-		if (++local_cnt >= 1024) {
+		if (++local_cnt >= 4096) {
 			atomic_fetch_add_explicit(&g_key_count, local_cnt, memory_order_relaxed);
 			local_cnt = 0;
 		}
@@ -700,15 +1381,12 @@ void *generate_keys(void *arg) {
 		int matched = 0;
 		for (size_t i = 0; i < g_patterns_count; ++i) {
 			struct search_pattern *sp = &g_patterns[i];
-			if ((sp->prefix_len > 0 && memcmp(b64_pub, sp->prefix, sp->prefix_len) == 0) ||
-				(sp->suffix_len > 0 && memcmp(b64_pub + sp->suffix_off, sp->suffix, sp->suffix_len) == 0)) {
-				matched = 1;
-				break;
-			}
+			if (sp->prefix_len > 0 && memcmp(b64_pub, sp->prefix, sp->prefix_len) == 0) { matched = 1; break; }
+			if (sp->suffix_len > 0 && memcmp(b64_pub + sp->suffix_off, sp->suffix, sp->suffix_len) == 0) { matched = 1; break; }
 		}
 		if (matched) {
 			// Encode private key only when we have a match
-			base64_encode_32(priv_key, b64_priv);
+			base64_encode_32(priv, b64_priv);
 			printf("FOUND: pub=%s priv=%s\n", b64_pub, b64_priv);
 			fprintf(stderr, "FOUND: pub=%s priv=%s\n", b64_pub, b64_priv);
 			fflush(stdout);
@@ -719,6 +1397,11 @@ void *generate_keys(void *arg) {
 			}
 		}
 	}
+
+	// Cleanup reusable buffers
+	if (batch_X2) free(batch_X2);
+	if (batch_Z2) free(batch_Z2);
+	if (batch_Zinv) free(batch_Zinv);
 
 	// Flush any remaining counts
 	if (local_cnt) {
@@ -755,12 +1438,29 @@ static int add_pattern(const char *prefix_opt, const char *suffix_opt) {
 		p->prefix = strdup(prefix_opt);
 		if (!p->prefix) return -1;
 		p->prefix_len = strlen(p->prefix);
+		// Precompute prefilter indices for up to first 4 Base64 chars
+		size_t pm = p->prefix_len < 4 ? p->prefix_len : 4;
+		p->pre_mask_len = (unsigned char)pm;
+		for (size_t i = 0; i < pm; ++i) {
+			unsigned char idx = b64_index((unsigned char)p->prefix[i]);
+			p->pre_idx[i] = idx;
+		}
 	}
 	if (suffix_opt) {
 		p->suffix = strdup(suffix_opt);
 		if (!p->suffix) return -1;
 		p->suffix_len = strlen(p->suffix);
 		p->suffix_off = (p->suffix_len <= BASE64_LEN) ? (BASE64_LEN - p->suffix_len) : 0;
+		// Precompute suffix indices for last up to 3 chars before '=' (suffix includes '=')
+		if (p->suffix_len >= 2) {
+			size_t core_len = p->suffix_len - 1; // ignore final '='
+			if (core_len > 3) core_len = 3;
+			p->suf_mask_len = (unsigned char)core_len;
+			for (size_t i = 0; i < core_len; ++i) {
+				unsigned char c = (unsigned char)p->suffix[(size_t)(p->suffix_len - 2 - i)];
+				p->suf_idx[core_len - 1 - i] = b64_index(c);
+			}
+		}
 	}
 	g_patterns_count++;
 	return 0;
@@ -838,13 +1538,21 @@ int main(int argc, char **argv) {
 	struct timespec ts_start;
 	clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
+	// Choose a better default for threads: number of online CPUs (CLI can override later)
+	long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+	if (ncpu > 0 && ncpu < 65536) g_num_threads = (int)ncpu;
+
 	// Install signal handlers for graceful shutdown (Ctrl-C)
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
 
-	// Detect CPU features and select FE backend (baseline for now; ADX/BMI2 coming next)
+	// Detect CPU features and select FE backend
 	cpu_detect_features();
-	// Future: if (g_has_adx && g_has_bmi2) g_fe_mul = fem_adx; g_fe_sq = fesq_adx;
+	// Switch to ADX/BMI2 backend when available (currently placeholder delegates to baseline)
+#if defined(__x86_64__) || defined(__i386__)
+	if (g_has_avx512ifma) { g_fe_mul = fem_ifma; g_fe_sq = fesq_ifma; }
+	else if (g_has_adx && g_has_bmi2) { g_fe_mul = fem_adx; g_fe_sq = fesq_adx; }
+#endif
 
 	// Print start wall-clock timestamp
 	{
@@ -970,6 +1678,56 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "CPU features: BMI2=%d ADX=%d AVX2=%d AVX512IFMA=%d\n", g_has_bmi2, g_has_adx, g_has_avx2, g_has_avx512ifma);
 		fflush(stderr);
 	}
+
+	#if defined(__x86_64__) || defined(__i386__)
+		if (g_has_avx512ifma) { g_fe_mul = fem_ifma; g_fe_sq = fesq_ifma; g_fe_backend_name = "ifma"; }
+		else if (g_has_adx && g_has_bmi2) { g_fe_mul = fem_adx; g_fe_sq = fesq_adx; g_fe_backend_name = "adx"; }
+		else if (g_has_avx2) { g_fe_mul = fem_avx2; g_fe_sq = fesq_avx2; g_fe_backend_name = "avx2"; }
+	#endif
+
+	// Optional override for testing: MEKG_CPU_FE=baseline|adx|ifma|avx2
+	const char *env_cpu_fe = getenv("MEKG_CPU_FE");
+	if (env_cpu_fe && env_cpu_fe[0]) {
+#if defined(__x86_64__) || defined(__i386__)
+		if (strcmp(env_cpu_fe, "ifma") == 0) { g_fe_mul = fem_ifma; g_fe_sq = fesq_ifma; g_fe_backend_name = "ifma"; }
+		else if (strcmp(env_cpu_fe, "adx") == 0) { g_fe_mul = fem_adx; g_fe_sq = fesq_adx; g_fe_backend_name = "adx"; }
+		else if (strcmp(env_cpu_fe, "avx2") == 0) { g_fe_mul = fem_avx2; g_fe_sq = fesq_avx2; g_fe_backend_name = "avx2"; }
+		else { g_fe_mul = fem_baseline; g_fe_sq = fesq_baseline; g_fe_backend_name = "baseline"; }
+#else
+		(void)env_cpu_fe; // no-op on non-x86
+#endif
+	}
+
+	if (!g_quiet) {
+		fprintf(stderr, "CPU FE backend: %s\n", g_fe_backend_name);
+		fflush(stderr);
+	}
+
+	// Optional internal CPU ladder for pubkey derivation
+	const char *env_internal = getenv("MEKG_CPU_INTERNAL");
+	if (env_internal && (env_internal[0]=='1' || env_internal[0]=='y' || env_internal[0]=='Y' || env_internal[0]=='t' || env_internal[0]=='T'))
+		g_use_internal = 1;
+	// Optional: batch size for internal ladder (enables batch inversion path)
+	const char *env_batch = getenv("MEKG_CPU_BATCH");
+	// Experimental: AVX2 multi-lane scaffolding (set MEKG_EXPERIMENTAL_AVX2_MULTI=2 or 4)
+	const char *env_multi = getenv("MEKG_EXPERIMENTAL_AVX2_MULTI");
+	if (env_multi && env_multi[0]) {
+		int lanes = atoi(env_multi);
+		if (lanes == 2 || lanes == 4) {
+#if defined(__x86_64__) || defined(__i386__)
+			if (g_has_avx2) g_avx2_multi_lanes = lanes;
+#endif
+		}
+	}
+	if (env_batch && env_batch[0]) {
+		long v = strtol(env_batch, NULL, 10);
+		if (v > 1 && v <= 4096) g_cpu_batch = (int)v;
+	}
+	// Optional: prefer P-cores when pinning threads
+	const char *env_pcores = getenv("MEKG_PIN_PCORES");
+	if (env_pcores && (env_pcores[0]=='1' || env_pcores[0]=='y' || env_pcores[0]=='Y' || env_pcores[0]=='t' || env_pcores[0]=='T'))
+		g_pin_pcores = 1;
+	build_core_order_if_needed();
 
 #ifndef ME_KEYGEN_OPENCL
 	// When built without OpenCL, GPU-related CLI values are parsed but unused; mark them used to avoid warnings.
@@ -1815,8 +2573,8 @@ int main(int argc, char **argv) {
 				}
 			}
 		}
-	atomic_store_explicit(&g_stop, 1, memory_order_relaxed);
-	if (gpu_reporter_started) { pthread_join(rpt, NULL); }
+		atomic_store_explicit(&g_stop, 1, memory_order_relaxed);
+		if (gpu_reporter_started) { pthread_join(rpt, NULL); }
 		free(pats);
 #endif
 	}

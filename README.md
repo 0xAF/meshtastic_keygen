@@ -15,6 +15,7 @@ A multi-threaded X25519 private/public keys pair generator/search tool targeting
 - Periodic stats (every 5s by default): total keys and keys/sec (per-second rate) in human-readable units
 - Quiet mode (-q/--quiet) to disable periodic reporting
 - Optional visually-better variants (-b/--better): for each -s STR, only check STR/, STR+, /STR=, +STR= (skip base STR/STR=)
+- Optional internal CPU ladder and batched inversion (C version): enable `MEKG_CPU_INTERNAL=1` and set `MEKG_CPU_BATCH=N` to amortize inversions across N keys for higher CPU throughput. See `C/README.md`.
 
 ## Build
 
@@ -50,6 +51,18 @@ There are two implementations:
   - -b, --better: Only search “visually better” variants for each STR, skipping the base STR/STR=
     - Prefix variants: STR/ and STR+
     - Suffix variants: /STR= and +STR=
+
+### CPU tuning (C version)
+
+- Use the internal ladder instead of OpenSSL and enable batched inversion:
+
+```sh
+cd C
+make -s
+MEKG_CPU_INTERNAL=1 MEKG_CPU_BATCH=256 ./meshtastic_keygen -s AAA -t 16 -q
+```
+
+See `C/README.md` for GPU defaults, autotune, field multiply switch, validation flags, and more CPU backend options. The C README also documents an optional lib25519 build target (make lib25519) that downloads and builds lib25519 locally, then links the app to use lib25519 for X25519 public-key derivation when selected.
 
 ### Redirecting output
 

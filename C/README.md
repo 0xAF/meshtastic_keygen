@@ -10,6 +10,18 @@ Requires OpenSSL and pthreads. Optional: OpenCL for GPU mode.
 make                     # builds meshtastic_keygen (with OpenCL if available)
 make OPENCL=0            # build without OpenCL support
 make debug               # builds meshtastic_keygen_debug with -g -O0
+# Optional SIMD builds (do not change defaults):
+make simd-avx2           # adds -mavx2 -mbmi2 -madx
+make simd-ifma           # adds -mavx512f -mavx512dq -mavx512ifma
+ 
+# Optional: build and link against lib25519
+make lib25519            # downloads and builds lib25519 locally, then links against it
+
+# Notes for lib25519 build:
+# - It fetches the latest release into C/third_party and builds an arch-specific package under build/amd64/package.
+# - Our app will then prefer lib25519 for X25519 public-key derivation (basepoint*sk) when available.
+# - We still use OpenSSL for everything else (CLI, RNG, etc.). This keeps the default build portable; lib25519 is opt-in.
+# - Prereqs: python3, a C toolchain (gcc/clang), make. No system-wide install is performed.
 ```
 
 ## Usage
@@ -26,11 +38,51 @@ make debug               # builds meshtastic_keygen_debug with -g -O0
   - `--count`, `-c`: Stop after C matches (default 1)
   - `--quiet`, `-q`: Disable periodic reporting (5s stats)
   - `--affinity`: Pin worker threads to CPU cores (Linux)
-  - `--better`, `-b`: Only search for "visually better" adjacent variants around your pattern (the base `STR` and `STR=` are skipped):  
-  - `--gpu`, `-g`: Use the OpenCL GPU implementation (requires OpenCL runtime and `opencl_keygen.cl`). Implements the full X25519 Montgomery ladder and matches the CPU path (validated against RFC 7748).
-    This keeps the requested `STR` but nudges it with Base64 boundary characters for nicer-looking keys.
+  - `--better`, `-b`: Only search for "visually better" adjacent variants around your pattern (the base `STR` and `STR=` are skipped):
     - Prefix variants: `STR/` and `STR+`
     - Suffix variants: `/STR=` and `+STR=`
+  - `--gpu`, `-g`: Use the OpenCL GPU implementation (requires OpenCL runtime and `opencl_keygen.cl`). Implements the full X25519 Montgomery ladder and matches the CPU path (validated against RFC 7748).
+
+### CPU internals and tuning
+
+- Internal CPU ladder: You can optionally use the built-in Montgomery ladder instead of OpenSSL for public key derivation.
+  - Enable via environment: `MEKG_CPU_INTERNAL=1`.
+  - By default, it computes one inversion per key.
+
+- Batched inversion (low-risk optimization): Amortize inversions by batching N keys at a time.
+  - Enable by selecting a batch size > 1: `MEKG_CPU_BATCH=64` (or 128/256, etc.).
+  - Requires `MEKG_CPU_INTERNAL=1`.
+  - Flow: compute X2/Z2 for N clamped secrets, do one product-tree batch inversion for all Z2, then finish N pub keys.
+  - Benefits: a single inversion per N keys; often a noticeable throughput bump on CPUs where inversion dominates.
+
+- Experimental: small multi-lane batching scaffold (AVX2)
+  - Gate: `MEKG_EXPERIMENTAL_AVX2_MULTI=2` or `4` (off by default).
+  - Requires `MEKG_CPU_INTERNAL=1` and a CPU with AVX2 (detected at runtime).
+  - Current behavior: uses the same per-key Montgomery ladder to produce X2/Z2 for 2 or 4 secrets, then performs a single batch inversion and completes those keys. This is a correctness-equivalent staging step for future true SIMD implementations.
+  - Notes: This is an internal scaffolding feature intended for development/benchmarking. Expect little to no speedup yet; real gains will come once the FE math and ladder are vectorized.
+
+Examples:
+
+```sh
+# Use internal ladder and batch inversion of 256 keys per batch
+MEKG_CPU_INTERNAL=1 MEKG_CPU_BATCH=256 ./meshtastic_keygen -s AAA -t 16 -q
+
+# Force a specific FE backend (optional): baseline|adx|avx2|ifma
+MEKG_CPU_FE=adx MEKG_CPU_INTERNAL=1 MEKG_CPU_BATCH=128 ./meshtastic_keygen -s AAA -t 16 -q
+
+# Build with ADX/BMI2 enabled (optional speedup on supporting CPUs)
+make simd-avx2
+MEKG_CPU_FE=adx ./meshtastic_keygen -s AAA -t 16 -q
+
+# Try the experimental AVX2 multi-lane scaffold (2 lanes)
+MEKG_CPU_INTERNAL=1 MEKG_EXPERIMENTAL_AVX2_MULTI=2 ./meshtastic_keygen -s AAA -t 16 -q
+```
+
+Notes:
+
+- Batch sizes between 64 and 512 tend to work well; try 128 or 256 first and benchmark.
+- Memory usage is modest: three arrays of `fe` structs sized to `MEKG_CPU_BATCH` per thread.
+- Correctness is unchanged; FE tests and RFC 7748 tests pass with batching enabled.
 
 ### Examples
 
@@ -54,7 +106,7 @@ make debug               # builds meshtastic_keygen_debug with -g -O0
 ./meshtastic_keygen -s AAA -s ZZZ -t 12 1>matches.txt
 ```
 
-## Notes
+## General notes
 
 - `FOUND:` lines are printed to both stdout and stderr so you can watch for finds while redirecting stdout to a file. All other messages (start time, stats, final summary) are printed to stderr.
 - Prints stats every 5 seconds (rate shown as keys per second) in human-readable units
@@ -206,3 +258,40 @@ Notes:
 - Autotune ignores your env overrides while probing, then prints and applies the selected values.
 - `MEKG_OCL_ITERS` is still capped to a conservative maximum internally to avoid long-running kernels.
 - CLI flags take precedence over environment variables for initial values; autotune, if enabled, will override both with its selection.
+
+## CPU feature detection and benchmark
+
+- At startup, the tool detects common x86 features (BMI2, ADX, AVX2, AVX‑512 IFMA) and prints a one-line summary unless `--quiet` is used. This prepares for future CPU-optimized backends.
+
+- CPU-only benchmark mode: set an environment variable to run for a fixed duration and report throughput without configuring searches:
+
+```sh
+# Run for 3 seconds using 8 threads, quiet mode
+cd C
+make -s clean meshtastic_keygen
+MEKG_BENCH_MS=3000 ./meshtastic_keygen -q -t 8
+```
+
+This mode uses the same generation pipeline as normal runs, but stops automatically after the specified milliseconds and prints total keys and keys/s.
+
+### Notes
+
+- The benchmark is CPU-only; it ignores `-g` and GPU flags.
+- You can still use `--threads` and `--quiet` to control concurrency and logging.
+
+### Selecting a CPU backend (optional)
+
+You can force a specific CPU field backend for testing/benchmarks using an environment variable:
+
+```sh
+# Options: baseline | adx | avx2 | ifma (if supported by your CPU)
+MEKG_CPU_FE=adx ./meshtastic_keygen -q -t 8 -s AAA -c 1
+```
+
+Auto-selection order (if not overridden): AVX‑512 IFMA first, then ADX+BMI2, then AVX2, otherwise baseline.
+
+#### Backend status
+
+- ADX/BMI2 backend: Implemented and selected automatically when supported; validated against RFC 7748 and FE self-tests. The implementation uses function multiversioning to stay portable by default and can benefit from ADX/BMI2 when available (or when building with `make simd-avx2`).
+- AVX2 backend: Implemented functionally (scalar 5×51 path with identical reduction to baseline). Future work: exploit AVX2 to batch multiple ladders for throughput.
+- AVX‑512 IFMA backend: Implemented functionally (scalar 5×51 path). Future work: replace with `_mm512_madd52lo/hi_epu64` for accelerated 5×51 mul on capable CPUs.
